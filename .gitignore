@@ -1,0 +1,42 @@
+# Environment variables (contains API keys)
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+
+# Local databases & data
+data/
+chroma_db/
+
+# Generated artifacts
+artifacts/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude Code (local settings only, don't commit project config)
+.claude/
+
+# Trae IDE internal files
+.trae/
+
+# External project references
+external/
+
+# PDF workspace (generated/license files)
+pdf/LICENSE.txt
