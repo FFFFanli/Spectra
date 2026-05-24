@@ -1,34 +1,31 @@
-# LangGraph 多 Agent 数据分析报告系统
+# Spectra — AI 智能数据分析平台
 
-基于 `FastAPI + LangGraph + DuckDB + Vue 3` 的多智能体数据分析应用，支持三种 Agent 协作模式、联网搜索、自动化工作流和定时巡检。
+基于 `FastAPI + LangGraph + DuckDB + Vue 3` 的单 Agent 数据分析应用，支持 LLM 自主工具调用、联网搜索、代码执行、数据分析和定时巡检。
 
 ---
 
-## 三种 Agent 模式
+## Agent 架构
 
-| 模式 | 后端入口 | API 端点 | 说明 |
-|---|---|---|---|
-| **Solo 单 Agent** | `backend/agent/single_agent.py` | `POST /api/agent/chat` | LLM ↔ Tool 自主循环，Agent 自己决定何时调用工具 |
-| **Team Supervisor (v2)** | `backend/agent/v2/runtime.py` | `POST /api/chat` | Supervisor + Coder/Writer/Researcher/Responder 多成员协作，executor → validator → fixer 三段式自检循环 |
-| **Graph 图 Agent** | `backend/agent/graph_agent.py` | `POST /api/graph/stream` | 动态 DAG 多节点流水线，每个节点是独立 Subgraph |
+采用 LangGraph StateGraph 实现 **LLM ↔ Tool 自主循环**：Agent 接收用户消息后自主决定调用哪些工具、何时停止，通过条件路由在 call_llm → call_tools → call_llm 之间循环直至任务完成。步数接近上限时自动触发 force_summarize 兜底，确保不返回空白消息。
 
-前端默认走"自动模式"：根据是否有上传文件 / 外部数据库 / 数据分析意图，在 Solo 与 Team 之间自动切换；用户也可在输入框模式选择器里手动锁定。
+- 入口：`backend/agent/single_agent.py` → `POST /api/chat`（SSE 流式）
+- 自研 DeepSeek V4 适配层，处理 reasoning_content 流式传输和孤儿工具调用修复
+- Validator-Fixer 自动修复循环：代码执行失败时自动诊断错误类型并生成修复代码
+- 支持 DashScope (Qwen) / OpenAI (GPT-4o) / DeepSeek (V4) 三套模型热切换
 
 ---
 
 ## 功能一览
 
 - 上传 CSV / Excel 到 DuckDB，自动解析入库
-- 自动数据体检与图表生成
-- Team Supervisor v2：Coder / Writer / Researcher / Responder 多成员协作 + executor → validator → fixer 自检循环
-- Human-in-the-loop 代码确认与自动修复回路
-- **联网搜索**：DuckDuckGo + Jina AI 多源 fallback
-- **5 套预定义自动化工作流**：AI 新闻日报、竞品监控、每周巡检、股价告警、安全漏洞日报
-- **工具生态**：搜索、爬取、计算器、图表生成、远程沙盒执行
-- 定时巡检预警（APScheduler + Cron）
-- SSE 流式通信，实时打字机效果
-- 对话记忆持久化（ChromaDB 向量检索 + SQLite）
-- 历史对话管理（LocalStorage，按时间分组）
+- 自动数据画像与图表生成（Plotly / ECharts）
+- **联网搜索**：DuckDuckGo + Google + Bing RSS 多引擎 fallback，Jina AI 网页爬取
+- **代码执行**：E2B 远程沙盒 + 本地 subprocess 安全扫描双引擎
+- **12 类工具**：搜索、爬取、计算器、图表生成、代码沙盒、DuckDB 查询、文件处理、文档导出、GTD 任务管理、知识库检索、用户记忆、定时任务
+- **定时巡检**（APScheduler + Cron），结果持久化到 SQLite
+- **对话记忆**：ChromaDB 向量检索 + SQLite 对话历史持久化
+- **报告导出**：Markdown → DOCX / PDF，支持图表嵌入与 CJK 字体适配
+- SSE 流式通信，实时打字机效果，推理链与工具调用过程可视化
 
 ---
 
@@ -37,31 +34,55 @@
 ```text
 project/
 ├── backend/
-│   ├── agent/                      # Agent 引擎
-│   │   ├── single_agent.py         # Solo 单 Agent (LLM ↔ Tool 循环)
-│   │   ├── graph_agent.py          # 图 Agent (动态 DAG + 5 套预定义工作流)
-│   │   └── v2/                     # Team Supervisor v2 (runtime / planner / members / infra)
-│   ├── tools/                      # LangChain Tool 工具包 (7 个工具)
-│   │   ├── web_search.py           # 联网搜索 + 网页爬取 (3 个工具)
-│   │   ├── calculator.py           # 安全数学表达式求值 + 描述性统计 (2 个工具)
-│   │   ├── visualization.py        # 智能图表生成 (1 个工具)
-│   │   └── sandbox.py              # E2B 远程沙盒 / 本地回退执行 (1 个工具)
-│   ├── api.py                      # FastAPI 路由 (20+ 端点)
-│   ├── db_utils.py                 # DuckDB 数据管理
-│   ├── search_service.py           # 纯 stdlib 搜索+爬取引擎
-│   ├── skill_registry.py           # Skill 注册与动态检索
-│   ├── state_store.py              # SQLite 任务与预警持久化
-│   ├── memory.py                   # ChromaDB 向量记忆检索
-│   ├── pdf_autofill_engine.py      # PDF 自动填充
-│   ├── report_templates.py         # 报告模板
-│   ├── local_exec_runner.py        # 本地子进程代码执行器
-│   └── app_paths.py                # 路径配置
+│   ├── agent/
+│   │   ├── single_agent.py          # Solo Agent (LLM ↔ Tool 循环)
+│   │   ├── graph_agent.py           # 图 Agent (DAG 多节点流水线，预留)
+│   │   ├── prompts.py               # 系统提示词
+│   │   ├── plan_state.py            # 计划状态管理
+│   │   └── v2/
+│   │       ├── llm.py               # LLM 工厂 (DeepSeekV4ChatOpenAI 适配层)
+│   │       └── infra/
+│   │           ├── executor_impl.py  # 代码执行器 (Validator-Fixer 自动修复)
+│   │           ├── validator.py     # 执行结果校验与错误分类
+│   │           └── skills.py        # Skill 定义
+│   ├── tools/                       # 12 类 LangChain 工具
+│   │   ├── web_search.py            # 联网搜索 + 网页爬取
+│   │   ├── calculator.py            # 安全数学表达式求值 + 描述性统计
+│   │   ├── visualization.py         # Plotly 图表生成
+│   │   ├── sandbox.py               # E2B 远程沙盒 / 本地回退执行
+│   │   ├── duckdb_tools.py          # DuckDB 查询与内省
+│   │   ├── heavy_tools.py           # 文件转换与重型处理
+│   │   ├── export_conversation.py   # DOCX 导出
+│   │   ├── task_manager.py          # GTD 任务管理 (持久化)
+│   │   ├── knowledge_base.py        # ChromaDB 知识库检索
+│   │   ├── user_memory.py           # 用户记忆存储与检索
+│   │   ├── cron_manager.py          # 定时任务管理
+│   │   └── user_interaction.py      # 用户交互 (ask_user, request_confirmation)
+│   ├── api.py                       # FastAPI 路由 (16 个端点)
+│   ├── db_utils.py                  # DuckDB 数据管理 (导入/查询/画像/外部数据库联邦)
+│   ├── search_service.py            # 纯 stdlib 搜索+爬取引擎
+│   ├── report_generator.py          # Markdown → DOCX/PDF 报告生成
+│   ├── memory.py                    # ChromaDB 向量记忆
+│   ├── conversation_store.py        # SQLite 对话历史持久化
+│   ├── state_store.py               # SQLite 任务与预警持久化
+│   ├── checkpoint_store.py          # LangGraph 状态检查点 (SQLite)
+│   ├── request_context.py           # ContextVar 请求级隔离
+│   ├── skill_loader.py              # Skill 动态加载
+│   ├── local_exec_runner.py         # 本地子进程代码执行器 (安全扫描)
+│   └── app_paths.py                 # 路径配置
 ├── frontend/
-│   ├── index.html                  # 单文件 Vue 3 应用
-│   └── static/                     # CDN 静态资源
-├── data/                           # DuckDB、SQLite 等运行期数据
-├── artifacts/                      # 图表 HTML/PNG、报告、导出文件
-└── tests/                          # 测试脚本
+│   ├── src/
+│   │   ├── App.vue                  # 根组件
+│   │   ├── store.js                 # 单例响应式 Store
+│   │   ├── components/              # ChatView, ChatMessage, Sidebar, ContextPanel 等
+│   │   ├── composables/             # useChat, useHistory, useSettings, usePreferences
+│   │   └── utils/                   # charts.js, sse.js, crypto.js
+│   ├── index.html                   # Vite 入口
+│   ├── vite.config.js               # Vite 配置 (代理 /api → :8000)
+│   └── package.json
+├── data/                            # DuckDB、SQLite 等运行期数据
+├── artifacts/                       # 图表 HTML/PNG、报告、导出文件
+└── tests/                           # 测试脚本
 ```
 
 ---
@@ -69,73 +90,80 @@ project/
 ## 环境要求
 
 - Python 3.11+
+- Node.js 18+ (前端开发)
 - Windows / macOS / Linux
 
-## 安装依赖
+---
+
+## 安装与启动
 
 ```bash
+# 后端
 pip install -r requirements.txt
+copy .env.example .env   # 编辑填入 API Key
+
+# 前端 (开发模式)
+cd frontend && npm install && npm run dev   # Vite :5173，代理 /api → :8000
+
+# 前端 (生产构建)
+cd frontend && npm run build                 # 输出到 frontend/dist/
 ```
 
-## 环境变量
-
-复制环境模板：
-
-```bash
-copy .env.example .env
-```
-
-关键变量：
+### 环境变量
 
 | 变量 | 必填 | 说明 |
 |---|---|---|
-| `DASHSCOPE_API_KEY` | ✅ | Qwen / DashScope API Key |
-| `E2B_API_KEY` | 否 | E2B 沙盒执行 Key（未配置时回退到本地执行） |
-| `TASK_TTL_SECONDS` | 否 | 任务状态保留时长，默认 `86400` |
-| `MAX_TASKS` | 否 | 最大任务保留数，默认 `500` |
-| `MAX_ALERTS` | 否 | 最大预警保留数，默认 `200` |
+| `DASHSCOPE_API_KEY` | 否 | 通义千问 API Key |
+| `OPENAI_API_KEY` | 否 | OpenAI API Key |
+| `DEEPSEEK_API_KEY` | 否 | DeepSeek API Key |
+| `E2B_API_KEY` | 否 | E2B 沙盒 Key（未配置时回退本地执行） |
+| `SPECTRA_ACCESS_CODE` | 否 | 访问密码（不设则无鉴权） |
 
----
-
-## 启动项目
+### 启动后端
 
 ```bash
-# 直接启动 (端口 8000，入口在 api.py 底部)
-python -m uvicorn backend.api:app --host 0.0.0.0 --port 8000
-
-# 带热重载 (开发模式)
 python -m uvicorn backend.api:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-启动后访问：[http://127.0.0.1:8000](http://127.0.0.1:8000)
+启动后访问 [http://127.0.0.1:8000](http://127.0.0.1:8000)
 
 ---
 
-## API 端点一览
+## API 端点
 
 ### 数据管理
 
 | 方法 | 路由 | 说明 |
 |---|---|---|
-| POST | `/api/upload` | 文件上传 (CSV/Excel → DuckDB) |
-| POST | `/api/connect_db` | 外部数据库直连 (MySQL/PostgreSQL) |
+| POST | `/api/upload` | 文件上传 (CSV/Excel → DuckDB, PDF/JSON → artifacts) |
+| POST | `/api/connect_db` | 外部数据库直连 (MySQL/PostgreSQL via DuckDB ATTACH) |
 | GET | `/api/tables` | 获取所有用户表 |
 | GET | `/api/table_data/{table_name}` | 获取表数据预览 |
-| POST | `/api/profile` | 自动数据体检报告 |
+| POST | `/api/profile` | 自动数据画像报告 |
 
-### Agent 对话 (SSE 流式)
-
-| 方法 | 路由 | 模式 | 事件类型 |
-|---|---|---|---|
-| POST | `/api/agent/chat` | Solo 单 Agent | `llm_stream`, `tool_start`, `tool_result`, `done`, `error` |
-| POST | `/api/chat` | Team Supervisor (v2) | `node`, `runtime`, `message`, `chart`, `file`, `report`, `done`, `error` 等 |
-| POST | `/api/graph/stream` | 图 Agent 模式 | `llm_stream`, `tool_start`, `tool_result`, `done` |
-
-### 工作流
+### Agent 对话
 
 | 方法 | 路由 | 说明 |
 |---|---|---|
-| GET | `/api/workflows` | 列出所有预定义工作流模板 |
+| POST | `/api/chat` | 统一 SSE 流式对话端点（Solo Agent + 全工具面板） |
+
+SSE 事件类型：`llm_stream`, `reasoning_stream`, `tool_start`, `tool_result`, `artifacts`, `file`, `usage`, `done`, `error`
+
+### 对话历史
+
+| 方法 | 路由 | 说明 |
+|---|---|---|
+| GET | `/api/conversations` | 对话列表 |
+| GET | `/api/conversations/{id}` | 获取单条对话 |
+| POST | `/api/conversations/{id}` | 保存对话 |
+| DELETE | `/api/conversations/{id}` | 删除单条 |
+| DELETE | `/api/conversations` | 清空全部 |
+
+### 报告导出
+
+| 方法 | 路由 | 说明 |
+|---|---|---|
+| POST | `/api/export_conversation` | 导出 DOCX / PDF 报告 |
 
 ### 定时调度
 
@@ -144,75 +172,43 @@ python -m uvicorn backend.api:app --host 0.0.0.0 --port 8000 --reload
 | POST | `/api/schedule` | 创建定时巡检任务 (Cron) |
 | GET | `/api/alerts` | 获取巡检预警记录 |
 
-### 其他
+### 配置
 
 | 方法 | 路由 | 说明 |
 |---|---|---|
-| POST | `/api/settings` | 更新 API Keys 配置 |
-| POST | `/api/chat_json` | JSON 阻塞模式（后台异步 + 轮询） |
-| POST | `/api/resume_json` | JSON 恢复模式 |
-| GET | `/api/task_status/{task_id}` | 任务状态轮询 |
+| POST | `/api/settings` | 更新 API Keys 与模型选择 |
+| GET | `/api/models` | 获取可用模型列表 |
+| GET | `/api/workflows` | 工作流模板列表 |
 
 ---
 
-## 预定义工作流模板
+## 工具面板（12 类）
 
-在自动化面板可一键启动：
-
-| 工作流 ID | 名称 | 流水线 |
+| 类别 | 工具 | 说明 |
 |---|---|---|
-| `ai_news_daily` | 每日 AI 新闻抓取 | 搜索 → 趋势分析 → 日报生成 |
-| `competitor_monitor` | 竞品数据监控日报 | 竞品搜索 → 策略分析 → 监控报告 |
-| `weekly_competitor_scan` | 每周竞品动态巡检 | 产品搜索 + 舆情搜索 → 综合分析 |
-| `stock_alert` | 股价/大盘异常告警 | 行情搜索 → 异常检测告警 |
-| `security_vuln_daily` | 安全漏洞日报 | 漏洞搜索 → 风险评估报告 |
-
----
-
-## Agent 工具生态 (7 个工具)
-
-| 工具 | 函数名 | 说明 |
-|---|---|---|
-| 联网搜索 | `web_search` | DuckDuckGo 搜索，返回 XML 格式结果 |
-| 网页爬取 | `crawl_page` | Jina AI 爬取全文（最高 8000 字符） |
-| 搜索+爬取 | `search_and_crawl_tool` | 搜索并爬取前 N 篇全文 |
-| 计算器 | `calculator` | 安全数学表达式求值（算术/三角/对数/统计） |
+| 联网搜索 | `web_search` | DuckDuckGo / Google / Bing RSS 多引擎 fallback |
+| 网页爬取 | `crawl_page` | Jina AI 全文爬取 + 本地 urllib 回退 |
+| 搜索+爬取 | `search_and_crawl` | 搜索并爬取前 N 篇全文 |
+| 计算器 | `calculator` | 安全数学表达式求值 |
 | 描述性统计 | `summarize_numbers` | 计数/总和/均值/中位数/标准差 |
-| 图表生成 | `generate_chart` | 根据 JSON/CSV 数据智能生成 Plotly 图表 |
-| 沙盒执行 | `execute_python` | E2B 远程执行 Python 代码，自动回退本地 |
+| 图表生成 | `generate_chart` | Plotly 交互式图表 (HTML + PNG) |
+| 沙盒执行 | `execute_python` | E2B 远程执行 + 本地安全扫描回退 |
+| DuckDB 查询 | `query_duckdb` 等 | SQL 查询、表内省、Schema 浏览 |
+| 重型处理 | `heavy_data_processing` | 大文件转换与批量处理 |
+| 文档导出 | `generate_docx` | Markdown → DOCX/PDF 报告 |
+| 任务管理 | `create_task` 等 | GTD 风格任务 CRUD |
+| 知识库 | `search_knowledge` | ChromaDB 语义检索 |
+| 用户记忆 | `save_memory` 等 | 偏好/事实/经验长期记忆 |
+| 定时任务 | `schedule_cron` | Cron 定时任务管理 |
+| 用户交互 | `ask_user` | 向用户提问或请求确认 |
 
 ---
 
-## 前端视图
+## E2B 沙盒说明
 
-| 视图 | 说明 |
-|---|---|
-| 聊天 (Chat) | 默认视图，对话 + 右侧 Agent Runtime 工作台 |
-| 自动化 (Automation) | 任务模板、定时配置、执行历史 |
-| 数据集/数据库 (Database) | 外部数据库直连配置 |
-| 系统设置 (Settings) | API Keys 配置 |
-
-聊天视图底部工具栏：上传按钮 / 停止按钮（加载中自动切换）、模式切换（Solo / Team）、模型选择。
-
----
-
-## 运行测试
-
-```bash
-# 单元测试
-python -m unittest discover -s tests -p "test_*.py" -v
-
-# 新增端点集成测试 (需先启动服务)
-$env:PYTHONIOENCODING='utf-8'; python tests/test_new_endpoints.py
-```
-
-覆盖范围：
-
-- `backend.db_utils.save_file_to_duckdb()`
-- `backend.db_utils.get_database_schema()`
-- `backend.agent.v2.infra.executor_impl.executor_node()`
-- `backend.agent.graph_agent` — 图 Agent 动态 DAG 构建
-- 全部 7 个 LangChain Tool 的导入与定义
+- 配置 `E2B_API_KEY` 后，LLM 生成的代码优先在 E2B 远程沙盒执行
+- 未配置时自动回退到本地子进程执行（`local_exec_runner.py`，含危险导入拦截与代码安全扫描）
+- 生产环境建议配置 E2B 以保证隔离性
 
 ---
 
@@ -222,24 +218,25 @@ $env:PYTHONIOENCODING='utf-8'; python tests/test_new_endpoints.py
 |---|---|
 | `data/data.duckdb` | 主数据仓库（DuckDB） |
 | `data/app_state.db` | 任务与预警持久化（SQLite） |
-| `data/runs/` | 每次代码执行的独立工作目录 |
-| `artifacts/` | 图表 HTML/PNG、清洗后 Excel、Word/PDF 报告 |
-| `chroma_db/` | ChromaDB 向量记忆数据 |
+| `data/checkpoints.db` | LangGraph 状态检查点（SQLite） |
+| `artifacts/` | 图表 HTML/PNG、报告、导出文件 |
+| `chroma_db/` | ChromaDB 向量记忆与知识库 |
 
 ---
 
-## E2B 沙盒说明
+## 运行测试
 
-- 配置 `E2B_API_KEY` 后，LLM 生成的代码优先在 E2B 远程沙盒执行
-- 未配置时自动回退到本地子进程执行（仅适合开发环境）
-- 生产环境建议强制沙盒执行
+```bash
+python -m unittest discover -s tests -p "test_*.py" -v
+```
 
 ---
 
 ## 架构要点
 
-1. **模式由场景决定**：单 Agent 用于日常对话和工具调用，图 Agent 用于固定流程的深度研究，群组编排用于多角色协作
-2. **Phase 状态驱动**：`state.phase`（`user_input` / `llm_result` / `tool_result`）显式决定流转
-3. **多引擎 Fallback**：搜索 DuckDuckGo → Google，爬取 Jina AI → 本地 urllib
-4. **SSE 事件标准化**：前端统一处理 `llm_stream`、`tool_start`、`tool_result`、`done`、`error`
-5. **Checkpointer 持久化**：LangGraph `MemorySaver`（开发）/ `SqliteSaver`（生产），支持中断恢复和 Human-in-the-loop
+1. **单 Agent 自主循环**：基于 LangGraph StateGraph，LLM 自主决策工具调用，通过条件路由实现 call_llm ↔ call_tools 循环
+2. **流中断容错**：针对 httpx / anyio / OpenAI SDK 的常见中断异常内置重试机制
+3. **多引擎 Fallback**：搜索 DuckDuckGo → Google → Bing RSS，爬取 Jina AI → 本地 urllib，沙盒 E2B → 本地 subprocess
+4. **请求级隔离**：基于 Python ContextVar 实现模型选择、用量统计、产物收集的线程/协程安全
+5. **持久化多层**：DuckDB (数据) + SQLite (对话/任务/检查点) + ChromaDB (向量记忆) + 文件系统 (产物)
+6. **SSE 事件标准化**：前端统一 dispatch 处理 `llm_stream`、`tool_start`、`tool_result`、`done`、`error` 等事件
