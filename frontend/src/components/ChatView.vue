@@ -10,6 +10,18 @@
           <span>{{ $store.currentWorkflow }}</span>
           <button @click="clearWorkflow" class="workflow-clear"><i class="fa-solid fa-xmark"></i></button>
         </div>
+        <div class="mode-selector">
+          <button
+            :class="['mode-btn', { active: $store.agentMode === 'solo' }]"
+            @click="setAgentMode('solo')"
+            title="单一 Agent 独立执行"
+          >Solo</button>
+          <button
+            :class="['mode-btn', { active: $store.agentMode === 'team' }]"
+            @click="setAgentMode('team')"
+            title="多 Agent 团队协作"
+          >Team</button>
+        </div>
       </div>
     </div>
     <div class="chat-messages" id="chat-container">
@@ -114,6 +126,11 @@ export default {
       handlePrimarySend()
     }
 
+    function setAgentMode(mode) {
+      store.agentMode = mode
+      localStorage.setItem('spectra_agent_mode', mode)
+    }
+
     return {
       $store: store,
       inputEl,
@@ -124,6 +141,7 @@ export default {
       resizeTextarea,
       clearWorkflow,
       saveSettingsSilent,
+      setAgentMode,
       onEnterKey,
     }
   }

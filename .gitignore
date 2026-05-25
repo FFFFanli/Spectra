@@ -40,3 +40,4 @@ external/
 
 # PDF workspace (generated/license files)
 pdf/LICENSE.txt
+.kiro/

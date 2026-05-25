@@ -15,6 +15,9 @@
       <button :class="['tab-btn', { active: activeTab === 'prefs' }]" @click="activeTab = 'prefs'">
         <i class="fa-solid fa-sliders"></i> 偏好设置
       </button>
+      <button :class="['tab-btn', { active: activeTab === 'team' }]" @click="activeTab = 'team'">
+        <i class="fa-solid fa-people-group"></i> Agent 团队
+      </button>
     </div>
 
     <!-- API 密钥 Tab -->
@@ -124,6 +127,36 @@
         </div>
       </div>
     </div>
+
+    <!-- Agent 团队 Tab -->
+    <div v-if="activeTab === 'team'" class="prefs-card">
+      <h3 class="section-title">Agent 工作模式</h3>
+      <p class="form-hint" style="margin-bottom:16px">选择单一 Agent 独立工作或多 Agent 团队协作。切换后立即生效。</p>
+      <div class="mode-cards">
+        <div
+          :class="['mode-card', { active: $store.agentMode === 'solo' }]"
+          @click="setAgentMode('solo')"
+        >
+          <div class="mode-card-header">
+            <i class="fa-solid fa-user"></i>
+            <span class="mode-card-title">Solo 模式</span>
+            <i v-if="$store.agentMode === 'solo'" class="fa-solid fa-circle-check mode-check"></i>
+          </div>
+          <p class="mode-card-desc">单一 Agent 独立执行任务。响应快，适合简单对话、问答、翻译等场景。</p>
+        </div>
+        <div
+          :class="['mode-card', { active: $store.agentMode === 'team' }]"
+          @click="setAgentMode('team')"
+        >
+          <div class="mode-card-header">
+            <i class="fa-solid fa-people-group"></i>
+            <span class="mode-card-title">Team 模式</span>
+            <i v-if="$store.agentMode === 'team'" class="fa-solid fa-circle-check mode-check"></i>
+          </div>
+          <p class="mode-card-desc">Supervisor 协调多个专业 Agent (Coder/Researcher/Writer/Responder) 协作完成复杂任务。适合深度分析、多步骤报告等场景。</p>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -213,12 +246,17 @@ export default {
       saveUserPreferences()
     }
 
+    function setAgentMode(mode) {
+      store.agentMode = mode
+      localStorage.setItem('spectra_agent_mode', mode)
+    }
+
     return {
       $store: store, activeTab, showPersonaForm, newName, newPrompt,
       editingPersonaId, editName, editPrompt,
       saveSettings, createPersona, startEditPersona, savePersonaEdit,
       cancelPersonaEdit, deletePersona, selectPersona, deselectPersona,
-      removePreference, dashscopePlaceholder, openaiPlaceholder, deepseekPlaceholder,
+      removePreference, setAgentMode, dashscopePlaceholder, openaiPlaceholder, deepseekPlaceholder,
     }
   }
 }
@@ -318,6 +356,19 @@ export default {
 .pref-remove { background: none; border: none; color: #94a3b8; cursor: pointer; font-size: 11px }
 .pref-remove:hover { color: #ef4444 }
 
+.mode-cards { display: flex; flex-direction: column; gap: 12px }
+.mode-card {
+  padding: 16px; border: 2px solid #e2e8f0; border-radius: 12px; cursor: pointer;
+  transition: all 0.15s; background: #fff;
+}
+.mode-card:hover { border-color: #cbd5e1 }
+.mode-card.active { border-color: #3b82f6; background: #eff6ff }
+.mode-card-header { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; font-size: 15px; font-weight: 600; color: #1e293b }
+.mode-card-header i:first-child { font-size: 18px; color: #64748b }
+.mode-card.active .mode-card-header i:first-child { color: #3b82f6 }
+.mode-check { margin-left: auto; color: #3b82f6; font-size: 18px }
+.mode-card-desc { font-size: 13px; color: #64748b; line-height: 1.6 }
+
 @media (prefers-color-scheme: dark) {
   .settings-view { background: #0f172a }
   .settings-title { color: #e2e8f0 }
@@ -338,5 +389,10 @@ export default {
   .save-btn.secondary:hover { background: #475569 }
   .cancel-btn { color: #94a3b8 }
   .cancel-btn:hover { background: #1e293b }
+  .mode-card { background: #0f172a; border-color: #334155 }
+  .mode-card:hover { border-color: #475569 }
+  .mode-card.active { border-color: #3b82f6; background: #1e3a5f }
+  .mode-card-header { color: #e2e8f0 }
+  .mode-card-desc { color: #94a3b8 }
 }
 </style>

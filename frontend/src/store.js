@@ -107,6 +107,7 @@ export const store = reactive({
 
   personas: [],          // 用户自定义角色模板 [{id, name, systemPrompt, createdAt}]
   selectedPersonaId: null,  // 当前选中的角色 ID
+  agentMode: localStorage.getItem('spectra_agent_mode') || 'solo',  // 'solo' | 'team'
 
   availableSkills: [
     { id: 'web-search', name: '联网搜索', category: '搜索', icon: 'fa-solid fa-globe', desc: '实时搜索互联网获取最新信息', color: '#3b82f6' },

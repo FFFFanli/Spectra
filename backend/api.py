@@ -29,6 +29,7 @@ from backend.app_paths import ARTIFACTS_DIR, DIST_DIR, FRONTEND_DIR, STATIC_DIR,
 from backend.db_utils import save_file_to_duckdb
 
 from backend.agent.single_agent import build_single_agent_graph
+from backend.agent.v2.runtime import TeamOrchestrationRuntime
 from backend.tools import ALL_TOOLS as AGENT_TOOLS
 from backend.tools.sandbox import SandboxSession
 from backend.tools.task_manager import set_thread_id as set_gtd_thread_id
@@ -561,6 +562,162 @@ async def chat(request: Request):
     }
 
     return EventSourceResponse(agent_event_generator(), headers=headers)
+
+
+@app.post("/api/v2/chat")
+async def chat_v2(request: Request):
+    """Team Supervisor v2 SSE 端点 —— 多 Agent 编排模式。"""
+    data = await request.json()
+    user_message = data.get("message", "") or ""
+    original_query = user_message
+    persona_system_prompt = data.get("persona_system_prompt", "").strip()
+    user_extra_prompt = data.get("system_prompt", "").strip()
+    if user_extra_prompt == "你是一个智能助手，可以使用联网搜索和网页爬取工具来获取最新信息，帮助用户解决问题。":
+        user_extra_prompt = ""
+
+    # 检索记忆
+    user_id = _resolve_user_id(request)
+    set_memory_user_id(user_id)
+    memory_context = await asyncio.to_thread(retrieve_memory_context, user_id, user_message)
+    if memory_context:
+        user_extra_prompt = f"{memory_context}\n\n{user_extra_prompt}".strip()
+
+    # 附带图表处理
+    attached_charts_input = data.get("attached_charts") or []
+    decoded_charts: list[dict] = []
+    for idx, item in enumerate(attached_charts_input):
+        if not isinstance(item, dict):
+            continue
+        data_url = item.get("dataUrl") or item.get("data_url") or ""
+        if not isinstance(data_url, str) or "," not in data_url:
+            continue
+        try:
+            png_bytes = base64.b64decode(data_url.split(",", 1)[1])
+        except Exception:
+            continue
+        if not png_bytes:
+            continue
+        suffix = ".png"
+        raw_name = (item.get("name") or "").strip()
+        if raw_name and raw_name.lower().endswith((".png", ".jpg", ".jpeg")):
+            file_name = raw_name
+        else:
+            file_name = f"chart_{idx + 1}{suffix}"
+        decoded_charts.append({
+            "name": file_name,
+            "title": item.get("title") or "",
+            "png_bytes": png_bytes,
+        })
+
+    # 附件透传：数据表信息注入 schema
+    attached_files = data.get("attached_files") or []
+    db_alias = data.get("db_alias", "").strip()
+    schema_lines = []
+    if attached_files:
+        for f in attached_files:
+            table = f.get("table_name", "")
+            name = f.get("name", "")
+            if table:
+                schema_lines.append(f"表 `{table}`：{name}")
+    if db_alias:
+        schema_lines.append(f"外部数据库：`{db_alias}`")
+    schema = "\n".join(schema_lines) if schema_lines else ""
+
+    # 导出请求处理
+    export_content = data.get("export_content") or {}
+    is_export_request = _looks_like_export(user_message)
+    if is_export_request and export_content:
+        set_export_content(export_content)
+
+    thread_id = data.get("thread_id", str(uuid.uuid4()))
+    model_name = data.get("model", "qwen3.6-plus")
+    begin_request(model_name)
+
+    if decoded_charts:
+        set_attached_charts(decoded_charts)
+
+    runtime = TeamOrchestrationRuntime()
+
+    async def v2_event_generator():
+        final_reply = ""
+        try:
+            with SandboxSession():
+                async for event in runtime.run(
+                    user_message=user_message,
+                    thread_id=thread_id,
+                    schema=schema,
+                    conversation_history=None,
+                ):
+                    event_type = event.get("event", "")
+                    event_data = event.get("data", {})
+
+                    if event_type == "supervisor_decision":
+                        yield {
+                            "event": "supervisor_decision",
+                            "data": json.dumps(event_data, ensure_ascii=False),
+                        }
+
+                    elif event_type == "agent_message":
+                        agent_id = event_data.get("agent_id", "")
+                        reply = event_data.get("reply", "")
+                        code = event_data.get("code", "")
+                        yield {
+                            "event": "agent_message",
+                            "data": json.dumps({
+                                "agent_id": agent_id,
+                                "reply": reply[:500],
+                                "has_code": bool(code),
+                            }, ensure_ascii=False),
+                        }
+
+                    elif event_type == "reply":
+                        final_reply = event_data.get("text", "")
+                        yield {
+                            "event": "reply",
+                            "data": json.dumps({"text": final_reply}, ensure_ascii=False),
+                        }
+
+                    elif event_type == "done":
+                        yield {
+                            "event": "done",
+                            "data": json.dumps({**event_data, "thread_id": thread_id}, ensure_ascii=False),
+                        }
+
+                    elif event_type == "error":
+                        yield {
+                            "event": "error",
+                            "data": json.dumps({"message": event_data.get("message", str(event_data))}, ensure_ascii=False),
+                        }
+
+            usage_summary = get_usage_summary()
+            yield {"event": "usage", "data": json.dumps(usage_summary, ensure_ascii=False)}
+
+            if final_reply.strip():
+                asyncio.create_task(asyncio.to_thread(
+                    save_structured_memory,
+                    user_id,
+                    f"用户需求: {original_query[:300]}\n回复摘要: {final_reply[:300]}",
+                    "context",
+                    thread_id,
+                    "v2_chat",
+                ))
+                set_last_assistant_reply(final_reply)
+
+            print(f"[Spectra SSE v2] done — final_reply len={len(final_reply)}, thread={thread_id[:8]}", flush=True)
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            yield {"event": "error", "data": str(e)}
+
+    headers = {
+        "X-Accel-Buffering": "no",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+    }
+
+    return EventSourceResponse(v2_event_generator(), headers=headers)
+
 
 def _looks_like_export(msg: str) -> bool:
     """检测用户消息是否包含导出文档意图。"""

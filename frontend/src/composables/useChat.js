@@ -123,6 +123,17 @@ function handleSSEEvent(eventType, data) {
   console.log('[Spectra] handleSSEEvent:', eventType, dataSummary, 'msgs:', store.messages.length)
 
   switch (eventType) {
+    case 'error':
+      console.error('[Spectra] SSE error event:', data)
+      store.thinkingStatus = '发生错误'
+      {
+        const targetMsg = ensureAssistantMessage()
+        const errText = typeof data === 'string' ? data : (data && data.message ? data.message : JSON.stringify(data))
+        targetMsg.content = `**❌ Agent 错误:**\n${errText}`
+      }
+      store.loading = false
+      break
+
     case 'node':
       if (data && data.status) {
         store.thinkingStatus = data.status
@@ -133,8 +144,9 @@ function handleSSEEvent(eventType, data) {
       break
 
     case 'reply':
-      if (data && typeof data === 'string') {
-        const content = data.replace(/\\n/g, '\n')
+      if (data) {
+        const text = typeof data === 'string' ? data : (data.text || '')
+        const content = text.replace(/\\n/g, '\n')
         const targetMsg = ensureAssistantMessage()
         targetMsg.content = content
       }
@@ -356,7 +368,40 @@ function handleSSEEvent(eventType, data) {
       }
       break
 
+    case 'supervisor_decision':
+      if (data) {
+        const payload = typeof data === 'string' ? JSON.parse(data) : data
+        if (payload && payload.type) {
+          store.thinkingStatus = `[Supervisor] ${payload.type}`
+          addTodo(`Supervisor: ${payload.type}`, 'Supervisor')
+        }
+      }
+      syncProcessBlock()
+      break
+
+    case 'agent_message':
+      if (data) {
+        const payload = typeof data === 'string' ? JSON.parse(data) : data
+        if (payload && payload.reply) {
+          const targetMsg = ensureAssistantMessage()
+          const label = payload.agent_id ? `**${payload.agent_id}**` : '**Agent**'
+          const codeHint = payload.has_code ? ' `[含代码]`' : ''
+          targetMsg.content += `${label}${codeHint}:\n${payload.reply}\n\n`
+          store.thinkingStatus = `${payload.agent_id || 'Agent'} 已完成回复`
+          addTodo(`${label} 完成`, payload.agent_id || 'Agent')
+        }
+      }
+      syncProcessBlock()
+      scrollToBottom()
+      break
+
     case 'done':
+      if (data) {
+        const payload = typeof data === 'string' ? JSON.parse(data) : data
+        if (payload && payload.thread_id) {
+          store.threadId = payload.thread_id
+        }
+      }
       store.thinkingStatus = '任务完成 ✓'
       store.loading = false
       const runningTodo = store.taskTodos.find(t => t.status === 'running')
@@ -442,7 +487,9 @@ export async function streamChat(body) {
   let eventCount = 0
 
   try {
-    const response = await streamFetch('/api/chat', body, store.abortController.signal)
+    const endpoint = store.agentMode === 'team' ? '/api/v2/chat' : '/api/chat'
+    console.log(`[Spectra] 🎯 Agent 模式: ${store.agentMode.toUpperCase()} → 请求端点: ${endpoint}`)
+    const response = await streamFetch(endpoint, body, store.abortController.signal)
     for await (const { event, data } of parseSSEStream(response)) {
       eventCount++
       handleSSEEvent(event, data)

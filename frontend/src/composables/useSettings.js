@@ -81,6 +81,7 @@ export async function loadSettingsFromStorage() {
   store.apiKeys.openai = openai
   store.apiKeys.deepseek = deepseek
   store.apiKeys.selectedModel = localStorage.getItem('selected_model') || 'qwen3.5-plus'
+  store.agentMode = localStorage.getItem('spectra_agent_mode') || 'solo'
   saveSettings(true)
 }
 
