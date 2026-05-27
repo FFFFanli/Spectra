@@ -11,6 +11,9 @@ from typing import Any, Optional
 
 from langchain_core.messages import BaseMessage
 
+# AgentResult 定义已迁移至 members.base，此处保留重导出以兼容 legacy_runtime
+from backend.agent.v2.members.base import AgentResult  # noqa: F401
+
 # ── 已知 Agent 集合 ──────────────────────────────────────────────
 KNOWN_AGENTS = ("coder", "writer", "researcher", "responder")
 
@@ -36,34 +39,6 @@ TASK_DONE = "task_done"
 ALL_TASKS_DONE = "all_tasks_done"
 REPLY_AND_FINISH = "reply_and_finish"
 FINISH = "finish"
-
-
-@dataclass
-class AgentResult:
-    """单个成员 Agent 的执行结果。"""
-
-    agent_id: str
-    status: str          # "ok" | "failed"
-    reply: str = ""
-    code: Optional[str] = None
-    artifacts: list[dict] = field(default_factory=list)
-    error: Optional[str] = None
-
-    def get(self, key: str, default=None):
-        """兼容 dict-like 访问（researcher.py 中用 [] 取值）。"""
-        if key == "status":
-            return self.status
-        if key == "code":
-            return self.code
-        if key == "reply":
-            return self.reply
-        if key == "artifacts":
-            return self.artifacts
-        if key == "error":
-            return self.error
-        if key == "agent_id":
-            return self.agent_id
-        return default
 
 
 @dataclass

@@ -126,6 +126,8 @@ def _artifact_type_from_name(name: str) -> tuple[Optional[str], Optional[str]]:
             return "validation_report", "report"
     if suffix == ".pdf":
         return "report_pdf", "report"
+    if suffix == ".pptx":
+        return "report_pptx", "report"
     return None, None
 
 
@@ -151,13 +153,14 @@ def _collect_local_artifacts(work_dir: Path, stdout_text: str, generated_files: 
     cleaned_file_path = None
     report_path = None
     pdf_report_path = None
+    pptx_report_path = None
     validation_report_path = None
     artifacts: list[dict] = []
     normalized_output = stdout_text
     seen_relpaths: set[str] = set()
 
     def move_and_record(rel_path: str, forced_type: Optional[str] = None) -> Optional[str]:
-        nonlocal chart_path, chart_png_path, cleaned_file_path, report_path, pdf_report_path, validation_report_path
+        nonlocal chart_path, chart_png_path, cleaned_file_path, report_path, pdf_report_path, pptx_report_path, validation_report_path
         rel_path = rel_path.strip().replace("\\", "/")
         if not rel_path or rel_path in seen_relpaths:
             return None
@@ -188,6 +191,8 @@ def _collect_local_artifacts(work_dir: Path, stdout_text: str, generated_files: 
             report_path = rel
         elif item_type == "report_pdf" and not pdf_report_path:
             pdf_report_path = rel
+        elif item_type == "report_pptx" and not pptx_report_path:
+            pptx_report_path = rel
         elif item_type == "validation_report" and not validation_report_path:
             validation_report_path = rel
         return rel
@@ -217,6 +222,7 @@ def _collect_local_artifacts(work_dir: Path, stdout_text: str, generated_files: 
         "cleaned_file_path": cleaned_file_path,
         "report_path": report_path,
         "pdf_report_path": pdf_report_path,
+        "pptx_report_path": pptx_report_path,
         "validation_report_path": validation_report_path,
         "artifacts": artifacts,
         "normalized_output": normalized_output,
@@ -229,6 +235,7 @@ def _collect_e2b_artifacts(sandbox: Sandbox, output_text: str) -> dict:
     cleaned_file_path = None
     report_path = None
     pdf_report_path = None
+    pptx_report_path = None
     validation_report_path = None
     artifacts: list[dict] = []
     normalized_output = output_text
@@ -271,21 +278,22 @@ def _collect_e2b_artifacts(sandbox: Sandbox, output_text: str) -> dict:
         sandbox_path = sandbox_path.strip()
         try:
             suffix = Path(sandbox_path).suffix.lower()
-            if suffix not in {".pdf", ".docx"}:
+            if suffix not in {".pdf", ".docx", ".pptx"}:
                 continue
             prefix = "report"
             local_path = ARTIFACTS_DIR / f"{prefix}_{uuid.uuid4().hex[:8]}{suffix}"
             local_path.write_bytes(sandbox.files.read_bytes(sandbox_path))
             rel = artifact_relpath(local_path)
             normalized_output = normalized_output.replace(f"REPORT_GENERATED:{sandbox_path}", f"REPORT_GENERATED:{rel}")
-            item_type = "report_pdf" if suffix == ".pdf" else "report_docx"
+            item_type_map = {".pdf": "report_pdf", ".docx": "report_docx", ".pptx": "report_pptx"}
+            item_type = item_type_map.get(suffix, "report_docx")
             _register_artifact(artifacts, item_type, rel)
             if item_type == "report_pdf" and not pdf_report_path:
                 pdf_report_path = rel
             elif item_type == "report_docx" and not report_path:
                 report_path = rel
-            elif item_type == "validation_report" and not validation_report_path:
-                validation_report_path = rel
+            elif item_type == "report_pptx" and not pptx_report_path:
+                pptx_report_path = rel
         except Exception:
             continue
 
@@ -295,6 +303,7 @@ def _collect_e2b_artifacts(sandbox: Sandbox, output_text: str) -> dict:
         "cleaned_file_path": cleaned_file_path,
         "report_path": report_path,
         "pdf_report_path": pdf_report_path,
+        "pptx_report_path": pptx_report_path,
         "validation_report_path": validation_report_path,
         "artifacts": artifacts,
         "normalized_output": normalized_output,
@@ -307,12 +316,29 @@ def _preflight_check(code: str) -> Optional[str]:
         r"pip\s+install",
         r"subprocess\.(run|call|Popen)\s*\(",
         r"os\.system\s*\(",
+        # 文件系统探索
+        r"\bos\.listdir\b",
+        r"\bos\.walk\b",
+        r"\bos\.scandir\b",
+        r"\bglob\.glob\b",
+        r"\.glob\s*\([\"\']",
+        r"\.rglob\s*\(",
+        # DuckDB 系统表探索
+        r"information_schema\s*\.\s*tables",
+        r"information_schema\s*\.\s*columns",
+        r"\bduckdb_tables\s*\(",
+        r"\bduckdb_columns\s*\(",
+        r"\bduckdb_databases\s*\(",
+        r"\bpg_catalog\b",
+        r"\bsqlite_master\b",
     ]
     for pattern in forbidden_patterns:
         if re.search(pattern, code, flags=re.IGNORECASE):
             return (
-                "生成的代码包含被禁止的外部命令或依赖安装逻辑。"
-                "请直接使用当前环境已有依赖完成任务，不要调用 pip、subprocess 或 os.system。"
+                "生成的代码包含被禁止的操作（系统命令执行、文件系统浏览或数据库系统表查询）。"
+                "请直接使用当前环境已有依赖完成任务，不要调用 pip、subprocess、os.system，"
+                "不要浏览文件系统（os.listdir/os.walk/glob），"
+                "不要直接查询数据库系统表。使用 list_tables / query_duckdb 工具完成数据访问。"
             )
     return None
 
@@ -517,6 +543,7 @@ def _execute_local_python_code(code: str, thread_id: str, attempt_index: int) ->
         "cleaned_file_path": artifact_info["cleaned_file_path"],
         "report_path": artifact_info["report_path"],
         "pdf_report_path": artifact_info["pdf_report_path"],
+        "pptx_report_path": artifact_info["pptx_report_path"],
         "validation_report_path": artifact_info["validation_report_path"],
         "artifacts": artifact_info["artifacts"],
         "stdout": payload.get("stdout", ""),
@@ -527,46 +554,83 @@ def _execute_local_python_code(code: str, thread_id: str, attempt_index: int) ->
     }
 
 
+# 哪些错误关键词判定为 sandbox 已死、应重建
+_DEAD_SANDBOX_PATTERNS = (
+    "port is not open", "502", "503", "504",
+    "connection refused", "connection reset", "remote end closed",
+    "sandbox not found", "sandbox is not running",
+)
+
+
+def _is_dead_e2b_error(exc: BaseException) -> bool:
+    msg = (str(exc) or "").lower()
+    return any(p.lower() in msg for p in _DEAD_SANDBOX_PATTERNS)
+
+
 def _try_e2b_execution(code: str, e2b_api_key: str, duckdb_path: Path) -> dict:
+    """带重试的 E2B 执行：撞 502/dead sandbox 自动重建并重跑，最多重试 2 次。"""
     template_id = os.environ.get("E2B_TEMPLATE_ID", "code-interpreter-v1")
-    with Sandbox.create(api_key=e2b_api_key, template=template_id) as sandbox:
-        if duckdb_path.exists():
-            sandbox.files.write("data.duckdb", duckdb_path.read_bytes())
-        if SEARCH_SERVICE_PATH.exists():
-            sandbox.files.write("search_service.py", SEARCH_SERVICE_PATH.read_bytes())
+    try:
+        sandbox_timeout = int(os.environ.get("SPECTRA_E2B_TIMEOUT", "1800"))
+    except (TypeError, ValueError):
+        sandbox_timeout = 1800
 
-        execution = sandbox.run_code(code)
-        stdout_text = execution.text or ""
-        error_text = ""
-        error_type = ""
-        if execution.error:
-            error_type = execution.error.name
-            error_text = f"{execution.error.name}: {execution.error.value}\n{execution.error.traceback}"
+    last_exc: Exception | None = None
+    max_retry = 2
+    for attempt in range(max_retry + 1):
+        try:
+            with Sandbox.create(
+                api_key=e2b_api_key, template=template_id, timeout=sandbox_timeout,
+            ) as sandbox:
+                if duckdb_path.exists():
+                    sandbox.files.write("data.duckdb", duckdb_path.read_bytes())
+                if SEARCH_SERVICE_PATH.exists():
+                    sandbox.files.write("search_service.py", SEARCH_SERVICE_PATH.read_bytes())
 
-        artifact_info = _collect_e2b_artifacts(sandbox, stdout_text)
+                execution = sandbox.run_code(code)
+                stdout_text = execution.text or ""
+                error_text = ""
+                error_type = ""
+                if execution.error:
+                    error_type = execution.error.name
+                    error_text = f"{execution.error.name}: {execution.error.value}\n{execution.error.traceback}"
 
-        if duckdb_path.exists():
-            try:
-                duckdb_path.write_bytes(sandbox.files.read_bytes("data.duckdb"))
-            except Exception:
-                pass
+                artifact_info = _collect_e2b_artifacts(sandbox, stdout_text)
 
-        return {
-            "result_output": artifact_info["normalized_output"],
-            "error_output": error_text,
-            "chart_path": artifact_info["chart_path"],
-            "chart_png_path": artifact_info["chart_png_path"],
-            "cleaned_file_path": artifact_info["cleaned_file_path"],
-            "report_path": artifact_info["report_path"],
-            "pdf_report_path": artifact_info["pdf_report_path"],
-            "validation_report_path": artifact_info["validation_report_path"],
-            "artifacts": artifact_info["artifacts"],
-            "stdout": stdout_text,
-            "stderr": "",
-            "traceback": error_text,
-            "error_type": error_type,
-            "execution_backend": "e2b",
-        }
+                if duckdb_path.exists():
+                    try:
+                        duckdb_path.write_bytes(sandbox.files.read_bytes("data.duckdb"))
+                    except Exception:
+                        pass
+
+                return {
+                    "result_output": artifact_info["normalized_output"],
+                    "error_output": error_text,
+                    "chart_path": artifact_info["chart_path"],
+                    "chart_png_path": artifact_info["chart_png_path"],
+                    "cleaned_file_path": artifact_info["cleaned_file_path"],
+                    "report_path": artifact_info["report_path"],
+                    "pdf_report_path": artifact_info["pdf_report_path"],
+                    "pptx_report_path": artifact_info["pptx_report_path"],
+                    "validation_report_path": artifact_info["validation_report_path"],
+                    "artifacts": artifact_info["artifacts"],
+                    "stdout": stdout_text,
+                    "stderr": "",
+                    "traceback": error_text,
+                    "error_type": error_type,
+                    "execution_backend": "e2b",
+                }
+        except Exception as exc:
+            last_exc = exc
+            if _is_dead_e2b_error(exc) and attempt < max_retry:
+                print(
+                    f"[Executor] E2B sandbox 撞 502/dead，第 {attempt + 1} 次重建并重试: {exc}"
+                )
+                continue
+            raise
+
+    # 所有重试都失败
+    raise last_exc if last_exc else RuntimeError("E2B retry budget exhausted")
 
 
 def _execute_python_code(code: str, thread_id: str, attempt_index: int) -> dict:
@@ -574,12 +638,19 @@ def _execute_python_code(code: str, thread_id: str, attempt_index: int) -> dict:
         return _execute_local_python_code(code, thread_id, attempt_index)
     e2b_api_key = os.environ.get("E2B_API_KEY", "").strip()
     if e2b_api_key:
+        # 整体超时（沙盒 + 代码执行 + 产物拉取）：默认 600s。
+        # 之前是 30s——对于带 LLM 思考时间或图表渲染的代码远不够，会让 E2B 路径几乎必然超时
+        # fallback 到本地子进程，弄得"E2B 老是失败"。
+        try:
+            wrapper_timeout = int(os.environ.get("SPECTRA_E2B_RUN_TIMEOUT", "600"))
+        except (TypeError, ValueError):
+            wrapper_timeout = 600
         try:
             with ThreadPoolExecutor(max_workers=1) as pool:
                 future = pool.submit(_try_e2b_execution, code, e2b_api_key, DUCKDB_PATH)
-                return future.result(timeout=30)
+                return future.result(timeout=wrapper_timeout)
         except FutureTimeoutError:
-            print("[Executor] E2B 沙盒执行超时 (30s)，回退到本地子进程执行。")
+            print(f"[Executor] E2B 沙盒执行超时 ({wrapper_timeout}s)，回退到本地子进程执行。")
         except Exception as exc:
             print(f"[Executor] E2B 沙盒执行失败，回退到本地子进程执行: {exc}")
     return _execute_local_python_code(code, thread_id, attempt_index)
@@ -631,18 +702,53 @@ def _validate_execution(state: dict) -> dict:
     cleaned_file_path = state.get("cleaned_file_path")
     report_path = state.get("report_path")
     pdf_report_path = state.get("pdf_report_path")
+    pptx_report_path = state.get("pptx_report_path")
     validation_report_path = state.get("validation_report_path")
 
+    has_report = bool(pdf_report_path or report_path or pptx_report_path)
     issues: list[str] = []
     if runtime_error:
         issues.append(f"运行时报错:\n{runtime_error}")
     if sender == "cleaner" and not cleaned_file_path:
         issues.append("清洗任务未导出清洗后的 Excel 文件。")
-    if sender in {"reporter", "planner", "form_filler"} and not (pdf_report_path or report_path):
+    if sender == "cleaner" and cleaned_file_path:
+        # 强校验：清洗产物必须有至少 1 行数据，否则视为清洗失败（典型场景：
+        # LLM 误把 search_results 等历史表当成目标，导致 query 空、写出只有表头的 xlsx）
+        try:
+            from openpyxl import load_workbook
+            cleaned_abs = (ARTIFACTS_DIR / cleaned_file_path).resolve()
+            if cleaned_abs.exists():
+                wb = load_workbook(cleaned_abs, read_only=True, data_only=True)
+                ws = wb.active
+                # max_row 包含表头行；扣掉后判断
+                data_row_count = max(0, (ws.max_row or 0) - 1)
+                wb.close()
+                if data_row_count == 0:
+                    issues.append(
+                        "清洗后的 Excel 文件只有表头、零行数据。常见原因：写错了目标表名，"
+                        "或 SQL/筛选条件导致结果为空。请重新检查 task 中提到的真实表名"
+                        "（不要查询 `search_results` 等其它表）并修复 SQL。"
+                    )
+        except Exception as exc:
+            # openpyxl 读不开就报错；正常 path 已经在 _collect_*_artifacts 阶段验证过文件可读
+            issues.append(f"清洗后的 Excel 文件无法读取以校验行数：{exc}")
+    if sender in {"reporter", "planner", "form_filler"} and not has_report:
         if chart_png_path or chart_path:
             issues.append("报告任务生成了图表文件，但未输出 PDF/DOCX 报告（图表未嵌入文档）。请使用 reportlab 生成 PDF 并用 Image 嵌入图表。")
         else:
-            issues.append("报告任务未生成可下载的 PDF 或文档报告，请使用 reportlab 的 SimpleDocTemplate 生成 PDF。")
+            issues.append("报告任务未生成可下载的 PDF、DOCX 或 PPTX 报告。")
+
+    # PPTX 专项校验：文件存在且能被 python-pptx 重新打开
+    if pptx_report_path:
+        pptx_abs = (ARTIFACTS_DIR / pptx_report_path).resolve()
+        if not pptx_abs.exists():
+            issues.append(f"PPTX 产物文件不存在: {pptx_report_path}")
+        else:
+            try:
+                from pptx import Presentation
+                Presentation(str(pptx_abs))
+            except Exception as pptx_e:
+                issues.append(f"PPTX 校验失败（无法用 python-pptx 打开）: {pptx_e}")
     if sender in {"reporter", "planner"} and clean_output:
         text_ref_patterns = [r"\[图表已生成:", r"CHART_GENERATED:", r"CHART_PNG_GENERATED:"]
         if any(re.search(p, clean_output) for p in text_ref_patterns):
@@ -737,6 +843,7 @@ def executor_node(state: dict) -> dict:
         "cleaned_file_path": exec_result["cleaned_file_path"],
         "report_path": exec_result["report_path"],
         "pdf_report_path": exec_result["pdf_report_path"],
+        "pptx_report_path": exec_result["pptx_report_path"],
         "validation_report_path": exec_result["validation_report_path"],
         "artifacts": exec_result["artifacts"],
         "last_stdout": exec_result["stdout"],
@@ -772,6 +879,8 @@ def validator_node(state: dict) -> dict:
             artifact_lines.append(f"- 报告：`{state['report_path']}`")
         if state.get("pdf_report_path"):
             artifact_lines.append(f"- PDF 报告：`{state['pdf_report_path']}`")
+        if state.get("pptx_report_path"):
+            artifact_lines.append(f"- PPTX 报告：`{state['pptx_report_path']}`")
         if state.get("validation_report_path"):
             artifact_lines.append(f"- 校验报告：`{state['validation_report_path']}`")
 
@@ -889,10 +998,15 @@ def fixer_node(state: dict) -> dict:
     task_goal = _get_task_goal(state)
     repair_history = list(state.get("repair_history", []) or [])
 
-    # schema 由调用方按需注入（与旧实现行为相同：legacy 直接读 db_utils）
+    # schema 由调用方按需注入，受 table_scope 约束
     try:
-        from backend.db_utils import get_database_schema
-        schema = get_database_schema()
+        from backend.request_context import get_table_scope
+        from backend.db_utils import get_scoped_database_schema
+        scope = get_table_scope()
+        if scope is not None and len(scope) > 0:
+            schema = get_scoped_database_schema(scope)
+        else:
+            schema = get_scoped_database_schema()  # 无 scope 时返回全库 schema
     except Exception:
         schema = ""
 

@@ -56,7 +56,7 @@ class ResearcherMember(BaseMember):
         )
         if skill is not None:
             ctx.skill_name = skill.name
-            ctx.skill_path = str(skill.path)
+            ctx.skill_path = ""  # SkillDef 无 path 字段
             ctx.skill_capability = skill.capability
             ctx.extra["skill_description"] = skill.description
             ctx.extra["skill_auto_created"] = auto_created

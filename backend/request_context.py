@@ -9,7 +9,7 @@ ContextVar 在 asyncio 下天然按 task 隔离 —— FastAPI 每个请求都�
 from __future__ import annotations
 
 from contextvars import ContextVar
-from typing import Optional
+from typing import Optional, Set
 
 from langchain_core.callbacks import UsageMetadataCallbackHandler
 
@@ -101,6 +101,41 @@ def get_request_model() -> str:
 def get_request_usage_callback() -> Optional[UsageMetadataCallbackHandler]:
     """返回本次请求的 usage callback，未初始化时返回 None。"""
     return _request_usage.get()
+
+
+# ── 数据访问范围控制 ─────────────────────────────────────────────
+# Agent 只能访问用户明确上传/附加的表和文件，禁止自由探索数据库或文件系统。
+# None = 未激活（无限制，向后兼容）；空 set = 已激活但无可访问资源。
+
+_table_scope: ContextVar[Optional[Set[str]]] = ContextVar("spectra_table_scope", default=None)
+_file_scope: ContextVar[Optional[Set[str]]] = ContextVar("spectra_file_scope", default=None)
+
+
+def set_table_scope(tables: Set[str]) -> None:
+    """设置当前请求允许访问的表名集合。None 表示不限制。"""
+    _table_scope.set(tables)
+
+
+def get_table_scope() -> Optional[Set[str]]:
+    """返回当前请求允许访问的表名集合。None = 未激活（不限制）。"""
+    return _table_scope.get()
+
+
+def add_to_table_scope(table_name: str) -> None:
+    """动态向当前 scope 追加一个表名。仅在 scope 已激活时生效。"""
+    scope = _table_scope.get()
+    if scope is not None:
+        scope.add(table_name)
+
+
+def set_file_scope(files: Set[str]) -> None:
+    """设置当前请求允许访问的文件路径集合。None 表示不限制。"""
+    _file_scope.set(files)
+
+
+def get_file_scope() -> Optional[Set[str]]:
+    """返回当前请求允许访问的文件路径集合。None = 未激活（不限制）。"""
+    return _file_scope.get()
 
 
 def get_usage_summary() -> dict:

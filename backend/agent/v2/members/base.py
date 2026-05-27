@@ -28,7 +28,34 @@ from backend.agent.v2.infra.executor import run_executor
 from backend.agent.v2.infra.fixer import run_fixer
 from backend.agent.v2.infra.validator import run_validator
 from backend.agent.v2.llm import _create_llm
-from backend.agent.v2.state import AgentResult
+
+
+@dataclass
+class AgentResult:
+    """单个成员 Agent 的执行结果。"""
+
+    agent_id: str
+    status: str          # "ok" | "failed"
+    reply: str = ""
+    code: Optional[str] = None
+    artifacts: list[dict] = field(default_factory=list)
+    error: Optional[str] = None
+
+    def get(self, key: str, default=None):
+        """兼容 dict-like 访问（researcher.py 中用 [] 取值）。"""
+        if key == "status":
+            return self.status
+        if key == "code":
+            return self.code
+        if key == "reply":
+            return self.reply
+        if key == "artifacts":
+            return self.artifacts
+        if key == "error":
+            return self.error
+        if key == "agent_id":
+            return self.agent_id
+        return default
 
 
 MAX_FIX_RETRIES = 3
@@ -46,6 +73,10 @@ class MemberContext:
     skill_path: Optional[str] = None
     skill_capability: Optional[str] = None
     extra: dict[str, Any] = field(default_factory=dict)
+    # MTC 新增字段
+    upstream_artifacts: list[dict] = field(default_factory=list)
+    output_format: str = ""          # pdf | docx | pptx
+    attached_files: list[dict] = field(default_factory=list)
 
 
 # ── 公共工具 ────────────────────────────────────────────────────

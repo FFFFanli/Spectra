@@ -35,6 +35,15 @@ PROJECT_ROOT = BACKEND_DIR.parent
 LOCAL_EXEC_TIMEOUT = 60
 _LOCAL_EXEC_ALLOWED = os.environ.get("SPECTRA_ENV", "").lower() != "production"
 
+# E2B 沙盒生命周期超时（秒）：默认 30 分钟。
+# 每次 run_code 之前会调 set_timeout 续期，避免长任务（report 写作 / 搜索调研）跑到一半 sandbox 被回收。
+# E2B SDK 默认只有 300s，远低于 deepseek-thinking + executor + validator + fixer 的总耗时。
+def _e2b_timeout() -> int:
+    try:
+        return int(os.environ.get("SPECTRA_E2B_TIMEOUT", "1800"))
+    except (TypeError, ValueError):
+        return 1800
+
 _current_session: ContextVar = ContextVar("sandbox_session", default=None)
 
 
@@ -170,7 +179,28 @@ class SandboxSession:
         with SandboxSession() as session:
             _current_session.set(session)
             # 所有 execute_python 调用自动复用此 session
+
+    健壮性：E2B sandbox 偶发 "running but port is not open" (502) ——
+    底层 envd daemon 进程被卡死或崩溃，但容器还在。本类在 run_code 撞 502 时
+    自动 kill + recreate sandbox 并重传所有文件，最多重试 MAX_E2B_RETRY 次，
+    对调用方透明。
     """
+
+    # 撞 502 / port-not-open 后允许重建 sandbox 重试的次数
+    MAX_E2B_RETRY = 2
+    # 哪些错误关键词判定为 sandbox 已死、需要重建
+    _DEAD_SANDBOX_PATTERNS = (
+        "port is not open",
+        "502",
+        "503",
+        "504",
+        "connection refused",
+        "connection reset",
+        "remote end closed",
+        "sandbox not found",
+        "sandbox is not running",
+        "ServerNotReachable",
+    )
 
     def __init__(self):
         self._e2b = None
@@ -178,17 +208,20 @@ class SandboxSession:
         self._backend: str | None = None
         self._uploaded: set[str] = set()
         self._closed = False
+        # 缓存重建 sandbox 用的参数
+        self._e2b_template: str | None = None
+        self._e2b_api_key: str | None = None
 
     def __enter__(self):
         self._closed = False
         e2b_key = os.environ.get("E2B_API_KEY", "") if _LOCAL_EXEC_ALLOWED else ""
 
         if e2b_key:
-            from e2b_code_interpreter import Sandbox as E2BSandbox
             template = os.environ.get("E2B_TEMPLATE_ID", "code-interpreter-v1")
-            self._e2b = E2BSandbox.create(api_key=e2b_key, template=template)
+            self._e2b_api_key = e2b_key
+            self._e2b_template = template
+            self._create_e2b_sandbox()
             self._backend = "e2b"
-            print(f"[SandboxSession] E2B sandbox created (template={template})")
         elif _LOCAL_EXEC_ALLOWED:
             ensure_directories()
             self._local_dir = DATA_DIR / "runs" / f"session_{uuid.uuid4().hex[:8]}"
@@ -200,6 +233,55 @@ class SandboxSession:
 
         _current_session.set(self)
         return self
+
+    def _create_e2b_sandbox(self) -> None:
+        """新建一个 E2B sandbox 并缓存到 self._e2b。"""
+        from e2b_code_interpreter import Sandbox as E2BSandbox
+        timeout = _e2b_timeout()
+        self._e2b = E2BSandbox.create(
+            api_key=self._e2b_api_key,
+            template=self._e2b_template,
+            timeout=timeout,
+        )
+        # 重建后必须重传文件，清空缓存
+        self._uploaded.clear()
+        print(
+            f"[SandboxSession] E2B sandbox created "
+            f"(template={self._e2b_template}, timeout={timeout}s)"
+        )
+
+    @classmethod
+    def _is_dead_sandbox_error(cls, exc: BaseException) -> bool:
+        """判断异常消息是否对应"sandbox 已死、应重建"。"""
+        msg = (str(exc) or "").lower()
+        for pat in cls._DEAD_SANDBOX_PATTERNS:
+            if pat.lower() in msg:
+                return True
+        return False
+
+    def _recycle_e2b_sandbox(self, reason: str) -> None:
+        """kill 当前损坏的 sandbox 并立即起一个新的，重传所有已上传过的文件。"""
+        print(f"[SandboxSession] recycling E2B sandbox (reason: {reason})")
+        if self._e2b is not None:
+            try:
+                self._e2b.kill()
+            except Exception as exc:
+                print(f"[SandboxSession] kill broken sandbox failed (ignored): {exc}")
+            self._e2b = None
+        self._create_e2b_sandbox()
+        # 重传 duckdb / search_service / 附带图表
+        if DUCKDB_PATH.exists():
+            self._ensure_file("data.duckdb", DUCKDB_PATH)
+        self._ensure_file("search_service.py", SEARCH_SERVICE_PATH)
+        try:
+            from backend.request_context import get_attached_charts
+            for chart in get_attached_charts():
+                name = (chart or {}).get("name") or ""
+                png_bytes = (chart or {}).get("png_bytes")
+                if name and png_bytes:
+                    self._e2b.files.write(name, png_bytes)
+        except Exception:
+            pass
 
     def __exit__(self, *args):
         self.close()
@@ -266,21 +348,59 @@ class SandboxSession:
             return self._run_local(code)
 
     def _run_e2b(self, code: str) -> dict:
-        execution = self._e2b.run_code(code)
-        stdout_text = "".join(execution.logs.stdout) if execution.logs.stdout else ""
-        stderr_text = "".join(execution.logs.stderr) if execution.logs.stderr else ""
-        error_text = ""
-        if execution.error:
-            error_text = f"{execution.error.name}: {execution.error.value}"
-        normalized_stdout, artifacts = _harvest_e2b_artifacts(self._e2b, stdout_text)
-        return {
-            "ok": not execution.error,
-            "stdout": normalized_stdout[:8000],
-            "stderr": stderr_text[:2000],
-            "error": error_text[:1000],
-            "backend": "e2b",
-            "artifacts": artifacts,
-        }
+        """跑一段代码，撞 502 / 死 sandbox 时自动重建并重试。"""
+        last_exc: Exception | None = None
+        for attempt in range(self.MAX_E2B_RETRY + 1):
+            # 续期 sandbox：每次 run_code 前把超时窗口重置回完整的 _e2b_timeout()
+            try:
+                self._e2b.set_timeout(_e2b_timeout())
+            except Exception as exc:
+                # set_timeout 失败本身就是 sandbox 死了的信号
+                if self._is_dead_sandbox_error(exc) and attempt < self.MAX_E2B_RETRY:
+                    self._recycle_e2b_sandbox(f"set_timeout failed: {exc}")
+                    last_exc = exc
+                    continue
+                print(f"[SandboxSession] E2B set_timeout error (ignored): {exc}")
+
+            try:
+                execution = self._e2b.run_code(code)
+            except Exception as exc:
+                last_exc = exc
+                if self._is_dead_sandbox_error(exc) and attempt < self.MAX_E2B_RETRY:
+                    self._recycle_e2b_sandbox(f"run_code raised: {exc}")
+                    # 文件已经在 _recycle 里重传过；duckdb 如果还需要会被 _ensure_file 跳过
+                    if _needs_duckdb(code):
+                        self._ensure_file("data.duckdb", DUCKDB_PATH)
+                    continue
+                # 不是 dead sandbox 的错误，往上抛由调用方决定（fallback 到本地）
+                raise
+
+            # 成功跑到这里，处理结果
+            stdout_text = "".join(execution.logs.stdout) if execution.logs.stdout else ""
+            stderr_text = "".join(execution.logs.stderr) if execution.logs.stderr else ""
+            error_text = ""
+            if execution.error:
+                error_text = f"{execution.error.name}: {execution.error.value}"
+            try:
+                normalized_stdout, artifacts = _harvest_e2b_artifacts(self._e2b, stdout_text)
+            except Exception as exc:
+                # 产物拉取阶段也可能撞 502
+                if self._is_dead_sandbox_error(exc) and attempt < self.MAX_E2B_RETRY:
+                    self._recycle_e2b_sandbox(f"harvest_artifacts failed: {exc}")
+                    last_exc = exc
+                    continue
+                raise
+            return {
+                "ok": not execution.error,
+                "stdout": normalized_stdout[:8000],
+                "stderr": stderr_text[:2000],
+                "error": error_text[:1000],
+                "backend": "e2b",
+                "artifacts": artifacts,
+            }
+
+        # 所有重试都失败：把最后一个异常往上抛，让上层 fallback 到本地
+        raise last_exc if last_exc else RuntimeError("E2B sandbox retry budget exhausted")
 
     def _run_local(self, code: str) -> dict:
         """本地子进程执行，复用 session 目录避免重复拷贝 DuckDB。"""
@@ -378,7 +498,7 @@ def _run_code_local(code: str) -> dict:
 
 
 def _run_code_e2b(code: str) -> dict:
-    """E2B 远程沙盒执行"""
+    """E2B 远程沙盒执行（带 dead-sandbox 重建重试）。"""
     from e2b_code_interpreter import Sandbox
 
     e2b_api_key = os.environ.get("E2B_API_KEY", "")
@@ -386,46 +506,58 @@ def _run_code_e2b(code: str) -> dict:
         return None  # 回退到本地
 
     template_id = os.environ.get("E2B_TEMPLATE_ID", "code-interpreter-v1")
-    try:
-        with Sandbox.create(api_key=e2b_api_key, template=template_id) as sandbox:
-            if DUCKDB_PATH.exists():
-                sandbox.files.write("data.duckdb", DUCKDB_PATH.read_bytes())
-            if SEARCH_SERVICE_PATH.exists():
-                sandbox.files.write("search_service.py", SEARCH_SERVICE_PATH.read_bytes())
+    max_retry = SandboxSession.MAX_E2B_RETRY
+    last_err: str | None = None
+    for attempt in range(max_retry + 1):
+        try:
+            with Sandbox.create(
+                api_key=e2b_api_key,
+                template=template_id,
+                timeout=_e2b_timeout(),
+            ) as sandbox:
+                if DUCKDB_PATH.exists():
+                    sandbox.files.write("data.duckdb", DUCKDB_PATH.read_bytes())
+                if SEARCH_SERVICE_PATH.exists():
+                    sandbox.files.write("search_service.py", SEARCH_SERVICE_PATH.read_bytes())
 
-            # 把请求附带的图表 PNG 写进沙盒根目录，供 LLM 用 python-docx /
-            # reportlab 直接嵌图（避免在沙盒里重画 ECharts）。
-            try:
-                from backend.request_context import get_attached_charts
-                for chart in get_attached_charts():
-                    name = (chart or {}).get("name") or ""
-                    png_bytes = (chart or {}).get("png_bytes")
-                    if name and png_bytes:
-                        sandbox.files.write(name, png_bytes)
-            except Exception:
-                # 图表注入失败不应阻断代码执行
-                pass
+                # 把请求附带的图表 PNG 写进沙盒根目录
+                try:
+                    from backend.request_context import get_attached_charts
+                    for chart in get_attached_charts():
+                        name = (chart or {}).get("name") or ""
+                        png_bytes = (chart or {}).get("png_bytes")
+                        if name and png_bytes:
+                            sandbox.files.write(name, png_bytes)
+                except Exception:
+                    pass
 
-            execution = sandbox.run_code(code)
-            stdout_text = "".join(execution.logs.stdout) if execution.logs.stdout else ""
-            stderr_text = "".join(execution.logs.stderr) if execution.logs.stderr else ""
-            error_text = ""
-            if execution.error:
-                error_text = f"{execution.error.name}: {execution.error.value}"
+                execution = sandbox.run_code(code)
+                stdout_text = "".join(execution.logs.stdout) if execution.logs.stdout else ""
+                stderr_text = "".join(execution.logs.stderr) if execution.logs.stderr else ""
+                error_text = ""
+                if execution.error:
+                    error_text = f"{execution.error.name}: {execution.error.value}"
 
-            # ── 产物拉取：在沙盒销毁前，把 stdout 中 marker 指向的文件搬到本地 ──
-            normalized_stdout, artifacts = _harvest_e2b_artifacts(sandbox, stdout_text)
+                normalized_stdout, artifacts = _harvest_e2b_artifacts(sandbox, stdout_text)
 
-            return {
-                "ok": not execution.error,
-                "stdout": normalized_stdout[:8000],
-                "stderr": stderr_text[:2000],
-                "error": error_text[:1000],
-                "backend": "e2b",
-                "artifacts": artifacts,
-            }
-    except Exception as e:
-        return {"ok": False, "stdout": "", "stderr": f"E2B sandbox error: {str(e)}", "backend": "e2b_error", "artifacts": []}
+                return {
+                    "ok": not execution.error,
+                    "stdout": normalized_stdout[:8000],
+                    "stderr": stderr_text[:2000],
+                    "error": error_text[:1000],
+                    "backend": "e2b",
+                    "artifacts": artifacts,
+                }
+        except Exception as e:
+            last_err = str(e)
+            if SandboxSession._is_dead_sandbox_error(e) and attempt < max_retry:
+                print(f"[_run_code_e2b] sandbox 撞 502/dead，第 {attempt + 1} 次重建并重试: {e}")
+                continue
+            return {"ok": False, "stdout": "", "stderr": f"E2B sandbox error: {last_err}",
+                    "backend": "e2b_error", "artifacts": []}
+
+    return {"ok": False, "stdout": "", "stderr": f"E2B sandbox retry exhausted: {last_err}",
+            "backend": "e2b_error", "artifacts": []}
 
 
 # 产物 marker → (本地文件名前缀, 默认后缀, 读取方式)
@@ -514,13 +646,19 @@ def execute_python(code: str) -> str:
     在安全的远程沙盒中执行 Python 代码,并返回执行结果。
 
     适用场景:
-    - 数据分析和数据处理 (使用 pandas, duckdb, numpy 等)
+    - 数据分析和数据处理 (使用 pandas, numpy 等)
     - 生成图表 (使用 plotly, 输出 CHART_GENERATED:xxx.html 和 CHART_PNG_GENERATED:xxx.png)
     - 生成 PDF 报告 (使用 reportlab, 输出 REPORT_GENERATED:xxx.pdf)
     - 文件处理和格式转换
     - 科学计算和统计建模
 
     可用库: pandas, numpy, duckdb, plotly, scikit-learn, statsmodels, openpyxl, kaleido, reportlab, pypdf, pdfplumber
+
+    【数据访问规则 —— 必须遵守】
+    - 禁止使用 os.listdir / os.walk / os.scandir / glob.glob / Path.glob / Path.rglob 浏览文件系统
+    - 禁止使用 duckdb 直接连接 data.duckdb 查询表列表或系统表
+    - 如需查询数据，请使用 list_tables 和 query_duckdb 工具，不要通过沙盒代码绕开
+    - 只能访问用户已在附件面板中明确提供的文件和数据表
 
     【重要：生成 PDF 报告时的强制要求】
     如果任务要求生成分析报告 PDF:
@@ -535,7 +673,17 @@ def execute_python(code: str) -> str:
         code: 可执行的 Python 代码
     """
     # 安全检查
-    forbidden = [r"!\s*pip\s+install", r"pip\s+install", r"subprocess\.(run|call|Popen)", r"os\.system"]
+    forbidden = [
+        r"!\s*pip\s+install", r"pip\s+install",
+        r"subprocess\.(run|call|Popen)", r"os\.system",
+        # 文件系统探索
+        r"\bos\.listdir\b", r"\bos\.walk\b", r"\bos\.scandir\b",
+        r"\bglob\.glob\b", r"\.glob\s*\([\"\']", r"\.rglob\s*\(",
+        # DuckDB 系统表探索
+        r"information_schema\s*\.\s*tables", r"information_schema\s*\.\s*columns",
+        r"\bduckdb_tables\s*\(", r"\bduckdb_columns\s*\(", r"\bduckdb_databases\s*\(",
+        r"\bpg_catalog\b", r"\bsqlite_master\b",
+    ]
     for pattern in forbidden:
         if re.search(pattern, code, re.IGNORECASE):
             return (

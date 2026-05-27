@@ -11,9 +11,8 @@ from typing import Optional
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from backend.agent.v2.llm import _create_llm
-from backend.agent.v2.members.base import BaseMember, MemberContext
+from backend.agent.v2.members.base import AgentResult, BaseMember, MemberContext
 from backend.agent.v2.prompts.responder import build_responder_prompt
-from backend.agent.v2.state import AgentResult
 
 
 class ResponderMember(BaseMember):

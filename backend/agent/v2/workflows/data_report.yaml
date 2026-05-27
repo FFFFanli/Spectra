@@ -1,0 +1,19 @@
+id: data_report
+title: 数据报告
+description: 对上传数据进行自动分析并生成可视化报告
+default_steps:
+  - description: 理解数据结构和字段含义
+    assignee_agent_id: coder
+    dependencies: []
+  - description: 执行数据清洗与预处理
+    assignee_agent_id: coder
+    dependencies: []
+  - description: 统计分析与可视化图表生成
+    assignee_agent_id: coder
+    dependencies: []
+  - description: 撰写数据分析报告
+    assignee_agent_id: writer
+    dependencies: []
+  - description: 复核报告结论与图表一致性
+    assignee_agent_id: reviewer
+    dependencies: []

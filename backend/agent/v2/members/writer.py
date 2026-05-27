@@ -21,8 +21,13 @@ class WriterMember(BaseMember):
     requires_code_execution = True
 
     def build_prompt(self, ctx: MemberContext) -> str:
-        # 上游产物：从 ctx.extra 里读，由 Runtime 在派单时注入
-        upstream_artifacts = ctx.extra.get("upstream_artifacts", "（无上游产物）")
+        # 上游产物：从 ctx.upstream_artifacts 和 ctx.extra 里读
+        upstream_artifacts = ctx.upstream_artifacts or ctx.extra.get("upstream_artifacts", "（无上游产物）")
+        if isinstance(upstream_artifacts, list):
+            upstream_artifacts = "\n".join(
+                f"- {a.get('name', a.get('type', ''))}: {a.get('url', a.get('summary', ''))}"
+                for a in upstream_artifacts
+            ) or "（无上游产物）"
         chart_png_hint = ctx.extra.get("chart_png_hint", "")
 
         skill_brief = "（无匹配 Skill）"
@@ -32,11 +37,14 @@ class WriterMember(BaseMember):
                 f"{ctx.extra.get('skill_description', '') or ''}"
             )
 
+        output_format = ctx.output_format or ctx.extra.get("output_format", "pdf")
+
         return build_writer_prompt(
             schema=ctx.schema,
             upstream_artifacts=upstream_artifacts,
             skill_brief=skill_brief,
             chart_png_hint=chart_png_hint,
+            output_format=output_format,
         )
 
     def default_reply(self) -> str:
@@ -53,7 +61,7 @@ class WriterMember(BaseMember):
         if skill is None:
             return
         ctx.skill_name = skill.name
-        ctx.skill_path = str(skill.path)
+        ctx.skill_path = ""  # SkillDef 无 path 字段
         ctx.skill_capability = skill.capability
         ctx.extra["skill_description"] = skill.description
         ctx.extra["skill_auto_created"] = auto_created

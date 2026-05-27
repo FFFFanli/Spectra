@@ -1,0 +1,323 @@
+<template>
+  <div class="chat-view team-chat-view">
+    <div class="chat-header">
+      <div class="header-left">
+        <button v-if="$store.isMobile" @click="$store.leftDrawerOpen = true" class="mobile-menu-btn">
+          <i class="fa-solid fa-bars"></i>
+        </button>
+        <span class="mode-tag team-tag">
+          <i class="fa-solid fa-people-group"></i>
+          Team
+        </span>
+        <div v-if="$store.currentWorkflow" class="workflow-badge">
+          <i class="fa-solid fa-diagram-project"></i>
+          <span>{{ $store.currentWorkflow }}</span>
+          <button @click="clearWorkflow" class="workflow-clear">
+            <i class="fa-solid fa-xmark"></i>
+          </button>
+        </div>
+        <ModeSelector />
+      </div>
+    </div>
+
+    <!-- Team 模式主体：左侧消息流 + 右侧 Workspace 面板（Phase 2 实装五分区） -->
+    <div class="team-body">
+      <div class="team-chat-pane">
+        <div class="chat-messages" id="chat-container">
+          <template
+            v-for="(msg, idx) in $store.messages"
+            :key="$store.conversationRenderKey + '-' + idx"
+          >
+            <ChatMessage
+              :msg="msg"
+              :msg-index="idx"
+              :thinking="idx === $store.messages.length - 1 ? $store.thinkingStatus : ''"
+              :streaming="$store.loading && msg.role === 'assistant' && idx === $store.messages.length - 1"
+            />
+          </template>
+          <div v-if="$store.messages.length === 0" class="empty-chat">
+            <div class="empty-icon">👥</div>
+            <h3 class="empty-title">Team 模式</h3>
+            <p class="empty-desc">多 Agent 协作、自动 Plan、产物导向，适合复杂任务</p>
+          </div>
+          <div v-if="$store.loading && $store.messages.length === 0" class="loading-indicator">
+            <div class="dots-loader">
+              <span></span><span></span><span></span>
+            </div>
+          </div>
+        </div>
+
+        <div class="chat-input-area">
+          <div v-if="$store.attachedFiles.length > 0" class="attached-files">
+            <div v-for="(f, i) in $store.attachedFiles" :key="i" class="attached-file-chip">
+              <i class="fa-solid fa-file"></i>
+              <span>{{ f.name }}</span>
+              <button @click="removeFile(i)" class="remove-file-chip">
+                <i class="fa-solid fa-xmark"></i>
+              </button>
+            </div>
+          </div>
+          <div v-if="$store.uploadStatus" :class="['upload-status', { error: $store.uploadError }]">
+            {{ $store.uploadStatus }}
+          </div>
+          <div class="input-shell">
+            <div class="input-controls">
+              <label class="model-select-label">
+                <select
+                  v-model="$store.apiKeys.selectedModel"
+                  @change="saveSettingsSilent"
+                  class="model-select"
+                >
+                  <option v-for="m in $store.models" :key="m.id" :value="m.id">{{ m.name }}</option>
+                </select>
+              </label>
+              <label v-if="$store.personas.length > 0" class="persona-select-label" title="选择助手角色">
+                <select v-model="$store.selectedPersonaId" class="persona-select">
+                  <option :value="null">🧑 默认</option>
+                  <option v-for="p in $store.personas" :key="p.id" :value="p.id">{{ p.name }}</option>
+                </select>
+              </label>
+            </div>
+            <div class="input-row">
+              <label class="upload-btn" title="上传文件">
+                <i class="fa-solid fa-paperclip"></i>
+                <input type="file" @change="handleFileUpload" hidden>
+              </label>
+              <textarea
+                ref="inputEl"
+                v-model="$store.userInput"
+                class="chat-textarea"
+                placeholder="描述你的复杂任务，团队会自动拆解执行..."
+                rows="1"
+                @keydown.enter.exact.prevent="onEnterKey"
+                @input="resizeTextarea"
+                :disabled="$store.loading"
+              ></textarea>
+              <button v-if="$store.loading" @click="handleStop" class="stop-btn" title="停止">
+                <i class="fa-solid fa-stop"></i>
+              </button>
+              <button
+                v-else
+                @click="handlePrimarySend"
+                class="send-btn"
+                :disabled="!$store.userInput.trim()"
+                title="发送"
+              >
+                <i class="fa-solid fa-paper-plane"></i>
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Workspace 面板已并入右侧 ProcessSidebar（待办/任务产物/参考信息），
+           避免与右侧栏重叠重复展示同样的 Plan/产物信息 -->
+    </div>
+    <!-- 工作流模板快捷入口 -->
+    <WorkflowSelector />
+  </div>
+</template>
+
+<script>
+import { ref, onMounted } from 'vue'
+import { store } from '../store.js'
+import ChatMessage from './ChatMessage.vue'
+import ModeSelector from './ModeSelector.vue'
+import WorkflowSelector from './WorkflowSelector.vue'
+import {
+  handlePrimarySend, handleStop, handleFileUpload, removeFile,
+  resizeTextarea, clearWorkflow,
+} from '../composables/useChat.js'
+import { saveSettings } from '../composables/useSettings.js'
+
+export default {
+  name: 'TeamChatView',
+  components: { ChatMessage, ModeSelector, WorkflowSelector },
+  setup() {
+    const inputEl = ref(null)
+
+    onMounted(() => {
+      store.inputArea = inputEl.value
+    })
+
+    function saveSettingsSilent() {
+      localStorage.setItem('selected_model', store.apiKeys.selectedModel)
+      saveSettings(true)
+    }
+
+    function onEnterKey(e) {
+      if (e.isComposing || e.keyCode === 229) return
+      handlePrimarySend()
+    }
+
+    return {
+      $store: store,
+      inputEl,
+      handlePrimarySend,
+      handleStop,
+      handleFileUpload,
+      removeFile,
+      resizeTextarea,
+      clearWorkflow,
+      saveSettingsSilent,
+      onEnterKey,
+    }
+  },
+}
+</script>
+
+<style scoped>
+.chat-view {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  overflow: hidden;
+  background: #fafbfc;
+}
+.chat-header {
+  padding: 10px 16px;
+  border-bottom: 1px solid #f1f5f9;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-shrink: 0;
+  background: #ffffff;
+}
+.header-left { display: flex; align-items: center; gap: 8px; }
+.mobile-menu-btn {
+  display: none; background: none; border: none; color: #475569;
+  cursor: pointer; font-size: 18px;
+}
+.mode-tag {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 3px 10px; border-radius: 10px; font-size: 11px; font-weight: 600;
+}
+.team-tag { background: #ede9fe; color: #6d28d9; }
+.workflow-badge {
+  display: flex; align-items: center; gap: 6px; padding: 4px 10px;
+  background: #ede9fe; border-radius: 8px; font-size: 12px; color: #6d28d9;
+}
+.workflow-clear { background: none; border: none; color: #94a3b8; cursor: pointer; font-size: 11px; }
+.team-body {
+  flex: 1; display: flex; overflow: hidden; min-height: 0;
+}
+.team-chat-pane {
+  flex: 1; display: flex; flex-direction: column; min-width: 0;
+  background: #ffffff;
+}
+.model-select {
+  padding: 3px 8px; border-radius: 14px; border: 1px solid #f1f5f9;
+  font-size: 11px; background: #fafafa; color: #475569; font-weight: 500;
+  cursor: pointer; outline: none; min-width: 90px;
+}
+.model-select:focus { border-color: #cbd5e1; }
+.persona-select {
+  padding: 3px 8px; border-radius: 14px; border: 1px solid #f1f5f9;
+  font-size: 11px; background: #fafafa; color: #8b5cf6; font-weight: 500;
+  cursor: pointer; outline: none; min-width: 70px; max-width: 110px;
+}
+.persona-select:focus { border-color: #c4b5fd; }
+.chat-messages {
+  flex: 1; overflow-y: auto; padding: 16px 24px;
+  display: flex; flex-direction: column; gap: 4px;
+  background: #ffffff;
+}
+.empty-chat {
+  flex: 1; display: flex; flex-direction: column;
+  align-items: center; justify-content: center; gap: 8px;
+}
+.empty-icon { font-size: 48px; color: #8b5cf6; opacity: 0.7; }
+.empty-title { font-size: 20px; font-weight: 600; color: #1e293b; }
+.empty-desc { color: #64748b; font-size: 14px; }
+.loading-indicator { display: flex; justify-content: center; padding: 24px; }
+.dots-loader { display: flex; gap: 6px; }
+.dots-loader span {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: #8b5cf6; animation: dot-bounce 1.3s infinite;
+}
+.dots-loader span:nth-child(2) { animation-delay: 0.15s; }
+.dots-loader span:nth-child(3) { animation-delay: 0.3s; }
+@keyframes dot-bounce {
+  0%, 100% { opacity: 0.3; transform: translateY(0); }
+  50% { opacity: 1; transform: translateY(-6px); }
+}
+.chat-input-area {
+  padding: 12px 16px 18px;
+  border-top: 1px solid #f1f5f9;
+  background: #ffffff;
+  flex-shrink: 0;
+}
+.chat-input-area > * {
+  width: min(760px, 100%);
+  margin-left: auto; margin-right: auto;
+}
+.attached-files { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; }
+.attached-file-chip {
+  display: flex; align-items: center; gap: 4px; padding: 3px 10px;
+  background: #e2e8f0; border-radius: 8px; font-size: 12px; color: #475569;
+}
+.remove-file-chip { background: none; border: none; color: #64748b; cursor: pointer; font-size: 10px; }
+.upload-status { font-size: 12px; color: #475569; margin-bottom: 4px; }
+.upload-status.error { color: #ef4444; }
+.input-shell {
+  border: 1px solid #f1f5f9;
+  background: #ffffff;
+  border-radius: 22px;
+  padding: 10px 12px 12px;
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.03);
+}
+.input-controls {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 12px; margin-bottom: 10px;
+}
+.input-row { display: flex; align-items: flex-end; gap: 8px; }
+.upload-btn {
+  width: 34px; height: 34px;
+  display: flex; align-items: center; justify-content: center;
+  color: #94a3b8; cursor: pointer; border-radius: 10px; transition: all 0.15s;
+}
+.upload-btn:hover { background: #f1f5f9; color: #475569; }
+.chat-textarea {
+  flex: 1; padding: 12px 14px; border: 1px solid #f1f5f9; border-radius: 18px;
+  font-size: 14px; resize: none; outline: none; background: #f8fafc; color: #0f172a;
+  transition: border-color 0.15s, box-shadow 0.15s; max-height: 200px; font-family: inherit;
+}
+.chat-textarea:focus { border-color: #c4b5fd; box-shadow: 0 0 0 3px rgba(196, 181, 253, 0.18); }
+.send-btn, .stop-btn {
+  width: 36px; height: 36px; border-radius: 14px; border: none;
+  display: flex; align-items: center; justify-content: center;
+  cursor: pointer; font-size: 14px; transition: all 0.15s;
+}
+.send-btn { background: #8b5cf6; color: #fff; }
+.send-btn:hover { background: #7c3aed; }
+.send-btn:disabled { background: #94a3b8; cursor: not-allowed; }
+.stop-btn { background: #ef4444; color: #fff; }
+.stop-btn:hover { background: #dc2626; }
+@media (max-width: 1023px) {
+  .mobile-menu-btn { display: block; }
+  .chat-messages { padding: 12px 8px; }
+  .input-controls { flex-direction: column; align-items: stretch; }
+}
+@media (prefers-color-scheme: dark) {
+  .chat-view { background: #0b1120; }
+  .chat-header { border-color: #1e293b; background: #0f172a; }
+  .team-tag { background: #4c1d95; color: #c4b5fd; }
+  .team-chat-pane { background: #0f172a; }
+  .model-select { border-color: #334155; background: #1e293b; color: #e2e8f0; }
+  .persona-select { border-color: #334155; background: #1e293b; color: #a78bfa; }
+  .chat-messages { color: #e2e8f0; background: #0f172a; }
+  .empty-title { color: #e2e8f0; }
+  .empty-desc { color: #64748b; }
+  .chat-input-area { border-color: #1e293b; background: #0f172a; }
+  .input-shell { border-color: #1e293b; background: #1e293b; }
+  .chat-textarea { border-color: #334155; background: #0f172a; color: #e2e8f0; }
+  .chat-textarea:focus { border-color: #7c3aed; box-shadow: 0 0 0 3px rgba(124, 58, 237, 0.22); }
+  .workflow-badge { background: #4c1d95; color: #c4b5fd; }
+  .upload-btn { color: #64748b; }
+  .upload-btn:hover { background: #334155; color: #94a3b8; }
+  .attached-file-chip { background: #1e293b; color: #94a3b8; }
+  .send-btn:disabled { background: #475569; }
+}
+</style>

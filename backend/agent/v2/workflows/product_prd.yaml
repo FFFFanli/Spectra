@@ -1,0 +1,19 @@
+id: product_prd
+title: 产品PRD
+description: 撰写完整的软件产品需求文档
+default_steps:
+  - description: 调研市场现状与用户需求
+    assignee_agent_id: researcher
+    dependencies: []
+  - description: 梳理核心功能与用户故事
+    assignee_agent_id: writer
+    dependencies: []
+  - description: 设计功能原型与技术架构
+    assignee_agent_id: coder
+    dependencies: []
+  - description: 撰写完整 PRD 文档
+    assignee_agent_id: writer
+    dependencies: []
+  - description: 复核需求一致性与技术可行性
+    assignee_agent_id: reviewer
+    dependencies: []

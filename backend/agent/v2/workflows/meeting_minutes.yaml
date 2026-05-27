@@ -1,0 +1,16 @@
+id: meeting_minutes
+title: 会议纪要
+description: 根据会议录音或文字记录生成结构化会议纪要
+default_steps:
+  - description: 解析会议录音/文字记录内容
+    assignee_agent_id: coder
+    dependencies: []
+  - description: 提取关键议题、决策与待办事项
+    assignee_agent_id: researcher
+    dependencies: []
+  - description: 生成结构化会议纪要文档
+    assignee_agent_id: writer
+    dependencies: []
+  - description: 复核纪要与原始记录一致性
+    assignee_agent_id: reviewer
+    dependencies: []

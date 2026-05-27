@@ -1,0 +1,19 @@
+id: activity_plan
+title: 活动方案
+description: 策划完整的线上线下活动方案，包含 PPT 大纲
+default_steps:
+  - description: 调研同类活动案例与行业趋势
+    assignee_agent_id: researcher
+    dependencies: []
+  - description: 策划活动主题、流程与亮点
+    assignee_agent_id: writer
+    dependencies: []
+  - description: 设计 PPT 大纲与版式建议
+    assignee_agent_id: designer
+    dependencies: []
+  - description: 整合生成活动方案文档与 PPT
+    assignee_agent_id: writer
+    dependencies: []
+  - description: 复核方案完整性与可执行性
+    assignee_agent_id: reviewer
+    dependencies: []

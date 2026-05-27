@@ -136,6 +136,68 @@ def get_table_preview(table_name: str, limit: int = 100) -> dict:
         return {"error": str(e), "columns": [], "rows": [], "total_rows": 0}
 
 
+def get_scoped_database_schema(table_names: set[str] | None = None) -> str:
+    """
+    获取指定表的 DDL 以及前几行数据。传入 None 时等同于 get_database_schema()（返回所有表）。
+
+    安全设计：Agent 修复器应通过此接口获取限定范围的 schema，
+    而不是通过 get_database_schema() 获取全库 schema。
+    """
+    if table_names is None:
+        return get_database_schema()
+
+    ensure_directories()
+    if not os.path.exists(DB_PATH):
+        return "数据库不存在，请先上传数据文件或连接数据库。"
+
+    if not table_names:
+        return "当前请求未包含任何数据表。"
+
+    try:
+        schema_info = "【当前任务涉及的数据表】:\n\n"
+        with duckdb.connect(DB_PATH) as con:
+            scope_set = {t.lower() for t in table_names}
+            columns_df = con.execute(
+                "SELECT table_name, column_name, data_type FROM duckdb_columns() "
+                "WHERE database_name != 'system'"
+            ).df()
+
+            if columns_df.empty:
+                return "数据库中没有任何表。"
+
+            grouped = columns_df.groupby("table_name")
+
+            found_any = False
+            for table, group in grouped:
+                if table.lower() not in scope_set:
+                    continue
+                found_any = True
+                display_table_name = table
+                cols_desc = ",\n  ".join(
+                    [f'"{row["column_name"]}" {row["data_type"]}' for _, row in group.iterrows()]
+                )
+                ddl = f'CREATE TABLE "{display_table_name}" (\n  {cols_desc}\n);'
+
+                try:
+                    df_sample = con.execute(
+                        f'SELECT * FROM "{display_table_name}" LIMIT 3'
+                    ).df()
+                    sample_data_str = df_sample.to_markdown()
+                except Exception:
+                    sample_data_str = "(无法获取示例数据)"
+
+                schema_info += f"--- 表名: {display_table_name} ---\n"
+                schema_info += f"表结构:\n{ddl}\n\n"
+                schema_info += f"数据示例 (前3行):\n{sample_data_str}\n\n"
+
+            if not found_any:
+                return f"指定的表 {', '.join(sorted(table_names))} 在数据库中不存在。"
+
+            return schema_info
+    except Exception as e:
+        return f"获取数据库结构时发生错误: {str(e)}"
+
+
 def get_database_schema() -> str:
     """
     获取 DuckDB 数据库中所有表的 DDL 以及前几行数据，支持多表关联分析。

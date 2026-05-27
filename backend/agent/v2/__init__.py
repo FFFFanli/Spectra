@@ -1,20 +1,14 @@
 """
-Team Supervisor v2 —— 多 Agent 编排实现，对齐 LobeHub 群组架构。
+Team v2 —— 多 Agent 编排实现。
 
-架构：
-- SupervisorPlanner: 纯状态机，不调 LLM
-- TeamOrchestrationRuntime: 循环调度
-- 6 种调度指令: assign / broadcast / execute_task / execute_tasks / respond / finish
-- 4 个成员 Agent: coder / writer / researcher / responder
+MTC 模式（默认）: TeamMTCRuntime — 统一执行体 + Plan 自动规划 + 并行调度
+Legacy 模式（灰度回退）: TeamOrchestrationRuntime — Supervisor 调度多 Agent
 """
 
-from backend.agent.v2.state import TeamState, make_initial_state
-from backend.agent.v2.planner import SupervisorPlanner
-from backend.agent.v2.runtime import TeamOrchestrationRuntime
+from backend.agent.v2.legacy_runtime import TeamOrchestrationRuntime
+from backend.agent.v2.mtc.runtime import TeamMTCRuntime
 
 __all__ = [
-    "TeamState",
-    "make_initial_state",
-    "SupervisorPlanner",
     "TeamOrchestrationRuntime",
+    "TeamMTCRuntime",
 ]

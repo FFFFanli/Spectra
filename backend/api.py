@@ -29,11 +29,12 @@ from backend.app_paths import ARTIFACTS_DIR, DIST_DIR, FRONTEND_DIR, STATIC_DIR,
 from backend.db_utils import save_file_to_duckdb
 
 from backend.agent.single_agent import build_single_agent_graph
-from backend.agent.v2.runtime import TeamOrchestrationRuntime
+from backend.agent.v2.legacy_runtime import TeamOrchestrationRuntime
+from backend.agent.v2.mtc.runtime import TeamMTCRuntime
 from backend.tools import ALL_TOOLS as AGENT_TOOLS
 from backend.tools.sandbox import SandboxSession
 from backend.tools.task_manager import set_thread_id as set_gtd_thread_id
-from backend.request_context import begin_request, get_usage_summary, get_request_model, set_attached_charts, set_export_content, set_last_assistant_reply
+from backend.request_context import begin_request, get_usage_summary, get_request_model, set_attached_charts, set_export_content, set_last_assistant_reply, set_table_scope
 from backend.skill_loader import find_skill_for_tool
 from langchain_core.messages import HumanMessage, AIMessage
 from backend.state_store import (
@@ -86,6 +87,13 @@ async def start_scheduler():
     init_state_store()
     init_conversation_store()
     await init_checkpoint_store()
+
+    # MTC Team 模式持久化表初始化
+    try:
+        from backend.agent.v2.mtc.persistence import init_db
+        init_db()
+    except Exception as e:
+        print(f"[startup] MTC init_db failed: {e}")
 
     # 将 scheduler 注入 cron 工具模块
     set_scheduler(scheduler)
@@ -192,34 +200,82 @@ async def list_models():
 
 @app.post("/api/upload")
 async def upload_file(file: UploadFile = File(...)):
-    """处理文件上传，存入 DuckDB"""
+    """处理文件上传。
+
+    分类：
+      - 表格类（CSV/Excel）→ 入 DuckDB，作为 attached_files 给 agent 查询
+      - PDF / PPTX / 图片 / 音视频 / JSON → 落到 ARTIFACTS_DIR，path 字段返给前端
+        Team 模式后续会调用 FileParser 解析这些文件并注入到 LLM 上下文（R7）
+    """
     if not file.filename:
         raise HTTPException(status_code=400, detail="缺少文件名")
 
     lower_name = file.filename.lower()
+
+    # 1) 表格类：CSV / Excel → 入 DuckDB
     if lower_name.endswith((".csv", ".xlsx", ".xls")):
         import tempfile
         temp_path = os.path.join(tempfile.gettempdir(), f"upload_{file.filename}")
-        with open(temp_path, "wb") as f:
-            f.write(await file.read())
-
-        with open(temp_path, "rb") as f:
-            df, table_name = save_file_to_duckdb(f, file.filename)
+        try:
+            with open(temp_path, "wb") as f:
+                f.write(await file.read())
+            with open(temp_path, "rb") as f:
+                df, table_name = save_file_to_duckdb(f, file.filename)
+        except ImportError as e:
+            # 常见环境问题：pandas/openpyxl 版本不匹配
+            raise HTTPException(
+                status_code=400,
+                detail=f"解析表格失败（依赖缺失或版本不兼容）: {e}",
+            ) from e
+        except Exception as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"解析表格失败: {e}",
+            ) from e
         return {"table_name": table_name, "rows": len(df), "file_type": "table"}
 
-    if lower_name.endswith((".pdf", ".json")):
-        ensure_directories()
-        suffix = Path(file.filename).suffix
-        target = ARTIFACTS_DIR / f"upload_{uuid.uuid4().hex[:8]}{suffix}"
-        with open(target, "wb") as f:
-            f.write(await file.read())
+    # 2) 非表格类：PDF / PPTX / 图片 / 音视频 / JSON 等 → 直接落盘
+    #    后续 Team 模式 FileParser 会按 mime_type 处理
+    parseable_suffixes = {
+        ".pdf": "pdf_template",
+        ".pptx": "presentation",
+        ".docx": "document",
+        ".png": "image",
+        ".jpg": "image",
+        ".jpeg": "image",
+        ".mp3": "audio",
+        ".wav": "audio",
+        ".mp4": "video",
+        ".mov": "video",
+        ".json": "json_context",
+        ".txt": "text",
+        ".md": "text",
+    }
+    suffix = Path(file.filename).suffix.lower()
+    if suffix in parseable_suffixes:
+        try:
+            ensure_directories()
+            target = ARTIFACTS_DIR / f"upload_{uuid.uuid4().hex[:8]}{suffix}"
+            with open(target, "wb") as f:
+                f.write(await file.read())
+        except Exception as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"保存文件失败: {e}",
+            ) from e
         return {
-            "file_type": "pdf_template" if lower_name.endswith(".pdf") else "json_context",
+            "file_type": parseable_suffixes[suffix],
             "path": target.name,
             "filename": file.filename,
         }
 
-    raise HTTPException(status_code=400, detail="仅支持 .csv、.xlsx、.xls、.pdf 和 .json 文件")
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            "不支持的文件类型。"
+            "支持: .csv .xlsx .xls .pdf .pptx .docx .png .jpg .jpeg .mp3 .wav .mp4 .mov .json .txt .md"
+        ),
+    )
 
 @app.post("/api/connect_db")
 async def connect_db(request: Request):
@@ -412,6 +468,15 @@ async def chat(request: Request):
         set_attached_charts(decoded_charts)
     if export_content:
         set_export_content(export_content)
+
+    # 设置数据访问范围：agent 只能查询用户明确附加的数据表
+    _scope_tables: set[str] = set()
+    for f in attached_files:
+        table = (f.get("table_name", "") or "").strip()
+        if table:
+            _scope_tables.add(table)
+    if _scope_tables:
+        set_table_scope(_scope_tables)
 
     single_graph = build_single_agent_graph(
         tools=AGENT_TOOLS,
@@ -610,15 +675,62 @@ async def chat_v2(request: Request):
         })
 
     # 附件透传：数据表信息注入 schema
+    # 规则：本次请求只把【用户实际附带的表】的 DDL + 前 3 行示例数据塞进 schema，
+    # 不把 DuckDB 中其它历史表混进来——避免 LLM 误把别的表当成本次任务对象去清洗/查询。
     attached_files = data.get("attached_files") or []
     db_alias = data.get("db_alias", "").strip()
-    schema_lines = []
+    schema_lines: list[str] = []
     if attached_files:
+        try:
+            from backend.db_utils import get_table_preview
+        except Exception:
+            get_table_preview = None  # type: ignore
+
+        attached_table_names = []
         for f in attached_files:
-            table = f.get("table_name", "")
+            table = (f.get("table_name") or "").strip()
             name = f.get("name", "")
-            if table:
-                schema_lines.append(f"表 `{table}`：{name}")
+            if not table:
+                continue
+            attached_table_names.append(table)
+            schema_lines.append(f'### 表 `{table}` （来源: {name}）')
+
+            # 取列信息 + 前 3 行示例
+            if get_table_preview is not None:
+                try:
+                    preview = get_table_preview(table, limit=3)
+                    cols = preview.get("columns") or []
+                    rows = preview.get("rows") or []
+                    total = preview.get("total_rows", 0)
+                    if cols:
+                        schema_lines.append("列（按顺序）：" + ", ".join(f"`{c}`" for c in cols))
+                    schema_lines.append(f"总行数：{total}")
+                    if rows:
+                        # markdown 表格预览
+                        header = "| " + " | ".join(str(c) for c in cols) + " |"
+                        sep = "| " + " | ".join("---" for _ in cols) + " |"
+                        body = []
+                        for r in rows[:3]:
+                            cells = [str(v) if v is not None else "" for v in r]
+                            body.append("| " + " | ".join(cells) + " |")
+                        schema_lines.append("前 3 行示例：")
+                        schema_lines.append(header)
+                        schema_lines.append(sep)
+                        schema_lines.extend(body)
+                except Exception:
+                    pass
+            schema_lines.append("")
+
+        if attached_table_names:
+            schema_lines.insert(
+                0,
+                "【本次任务涉及的数据表（请只对这些表操作，不要查询 DuckDB 中其它表）】"
+            )
+            schema_lines.append(
+                f"⚠️ 重要：本次请求只能操作以下表：{', '.join('`' + t + '`' for t in attached_table_names)}。"
+                f"DuckDB 中可能存在其它历史表，禁止查询或写入它们。"
+            )
+
     if db_alias:
         schema_lines.append(f"外部数据库：`{db_alias}`")
     schema = "\n".join(schema_lines) if schema_lines else ""
@@ -636,7 +748,26 @@ async def chat_v2(request: Request):
     if decoded_charts:
         set_attached_charts(decoded_charts)
 
-    runtime = TeamOrchestrationRuntime()
+    # 设置数据访问范围：agent 只能查询用户明确附加的数据表
+    _scope_tables_v2: set[str] = set()
+    for f in attached_files:
+        table = (f.get("table_name", "") or "").strip()
+        if table:
+            _scope_tables_v2.add(table)
+    if _scope_tables_v2:
+        set_table_scope(_scope_tables_v2)
+
+    # 灰度开关：SPECTRA_TEAM_MTC_ENABLED 控制新旧 Runtime 路由
+    mtc_enabled = os.environ.get("SPECTRA_TEAM_MTC_ENABLED", "1")
+    runtime_variant = "mtc" if mtc_enabled == "1" else "legacy"
+
+    if runtime_variant == "mtc":
+        runtime = TeamMTCRuntime()
+    else:
+        runtime = TeamOrchestrationRuntime()
+
+    # 新请求体可选字段
+    skill_workflow_id = data.get("skill_workflow_id", None)
 
     async def v2_event_generator():
         final_reply = ""
@@ -647,6 +778,8 @@ async def chat_v2(request: Request):
                     thread_id=thread_id,
                     schema=schema,
                     conversation_history=None,
+                    attached_files=attached_files if runtime_variant == "mtc" else None,
+                    skill_workflow_id=skill_workflow_id if runtime_variant == "mtc" else None,
                 ):
                     event_type = event.get("event", "")
                     event_data = event.get("data", {})
@@ -689,8 +822,41 @@ async def chat_v2(request: Request):
                             "data": json.dumps({"message": event_data.get("message", str(event_data))}, ensure_ascii=False),
                         }
 
-            usage_summary = get_usage_summary()
-            yield {"event": "usage", "data": json.dumps(usage_summary, ensure_ascii=False)}
+                    # MTC 新增事件：直接透传
+                    elif event_type in (
+                        "plan_created", "plan_updated", "plan_revised",
+                        "step_started", "step_completed", "step_failed",
+                        "member_status",
+                        "task_pending", "task_progress", "task_completed", "task_failed",
+                        "file_parsed", "workspace_artifact_added",
+                    ):
+                        yield {
+                            "event": event_type,
+                            "data": event_data if isinstance(event_data, str) else json.dumps(event_data, ensure_ascii=False),
+                        }
+
+                    elif event_type == "artifacts":
+                        yield {
+                            "event": "artifacts",
+                            "data": event_data if isinstance(event_data, str) else json.dumps(event_data, ensure_ascii=False),
+                        }
+
+                    elif event_type == "file":
+                        yield {
+                            "event": "file",
+                            "data": event_data if isinstance(event_data, str) else json.dumps(event_data, ensure_ascii=False),
+                        }
+
+                    elif event_type == "usage":
+                        yield {
+                            "event": "usage",
+                            "data": event_data if isinstance(event_data, str) else json.dumps(event_data, ensure_ascii=False),
+                        }
+
+            # 兜底 usage（仅 legacy runtime 需要；mtc runtime 自行 emit）
+            if runtime_variant == "legacy":
+                usage_summary = get_usage_summary()
+                yield {"event": "usage", "data": json.dumps(usage_summary, ensure_ascii=False)}
 
             if final_reply.strip():
                 asyncio.create_task(asyncio.to_thread(
@@ -703,7 +869,7 @@ async def chat_v2(request: Request):
                 ))
                 set_last_assistant_reply(final_reply)
 
-            print(f"[Spectra SSE v2] done — final_reply len={len(final_reply)}, thread={thread_id[:8]}", flush=True)
+            print(f"[Spectra SSE v2] done — final_reply len={len(final_reply)}, thread={thread_id[:8]}, variant={runtime_variant}", flush=True)
 
         except Exception as e:
             import traceback
@@ -717,6 +883,70 @@ async def chat_v2(request: Request):
     }
 
     return EventSourceResponse(v2_event_generator(), headers=headers)
+
+
+@app.get("/api/v2/workflows")
+async def get_workflows():
+    """返回所有可用的 Skill_Workflow 模板列表。"""
+    try:
+        from backend.agent.v2.mtc.workflow_loader import WorkflowLoader
+        loader = WorkflowLoader()
+        workflows = loader.load_all()
+        return {
+            "workflows": [
+                {
+                    "id": wf.id,
+                    "title": wf.title,
+                    "description": wf.description,
+                    "default_steps": wf.default_steps,
+                }
+                for wf in workflows
+            ]
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/v2/plan/{thread_id}")
+async def get_plan(thread_id: str):
+    """返回指定 thread 的最新 Plan 快照与 Artifact 列表。"""
+    try:
+        from backend.agent.v2.mtc.persistence import PlanPersistence
+        persist = PlanPersistence()
+        plan = persist.load_plan(thread_id)
+        if plan is None:
+            return {"plan": None, "artifacts": []}
+
+        # 收集该 thread 的 artifacts
+        import glob as _glob
+        artifacts_dir = ARTIFACTS_DIR / thread_id
+        artifacts = []
+        if artifacts_dir.exists():
+            for f in _glob.glob(str(artifacts_dir / "*")):
+                rel = str(Path(f).relative_to(ARTIFACTS_DIR.parent))
+                artifacts.append({
+                    "name": Path(f).name,
+                    "url": f"/files/{rel}",
+                })
+
+        return {"plan": plan, "artifacts": artifacts}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/v2/tasks")
+async def get_tasks(thread_id: str = ""):
+    """返回指定 thread 的所有 Background_Task 状态。"""
+    try:
+        from backend.agent.v2.mtc.persistence import TaskPersistence
+        persist = TaskPersistence()
+        if thread_id:
+            tasks = persist.load_thread_tasks(thread_id)
+        else:
+            tasks = []
+        return {"tasks": tasks}
+    except Exception as e:
+        return {"error": str(e)}
 
 
 def _looks_like_export(msg: str) -> bool:

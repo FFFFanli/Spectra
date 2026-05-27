@@ -17,19 +17,24 @@ def _build_search_data_snippet(query: str, max_results: int = 10) -> tuple[str, 
 
     snippet 是可直接注入 prompt 的 Python 代码片段。
     """
-    results = search_and_crawl(query, max_results=max_results)
-    sr_count = len(results)
-    crawled_count = sum(1 for r in results if r.get("content"))
+    sr, crawled = search_and_crawl(query, search_results=max_results)
+    sr_count = len(sr)
+    crawled_count = len(crawled)
 
     # 构建 Python 字面量
     search_data = []
-    for r in results:
+    for r in sr:
         search_data.append({
-            "title": r.get("title", ""),
-            "url": r.get("url", ""),
-            "snippet": r.get("snippet", ""),
-            "content": r.get("content", ""),
+            "title": r.title,
+            "url": r.url,
+            "snippet": r.snippet,
         })
+    for cr in crawled:
+        # 查找对应 URL 的条目并补充 content
+        for item in search_data:
+            if item["url"] == cr.url:
+                item["content"] = cr.content
+                break
 
     snippet = (
         "_SEARCH_RESULTS = " + json.dumps(search_data, ensure_ascii=False, indent=2) + "\n\n"

@@ -1,0 +1,16 @@
+id: competitor_analysis
+title: 竞品分析
+description: 对指定竞品进行多维度分析，输出对比报告
+default_steps:
+  - description: 调研竞品基本信息与市场定位
+    assignee_agent_id: researcher
+    dependencies: []
+  - description: 分析竞品核心功能与差异化特性
+    assignee_agent_id: researcher
+    dependencies: []
+  - description: 整理竞品对比分析报告
+    assignee_agent_id: writer
+    dependencies: []
+  - description: 复核报告数据准确性
+    assignee_agent_id: reviewer
+    dependencies: []

@@ -104,7 +104,28 @@
             />
           </template>
         </div>
-        <div v-if="msg.downloadFile" class="download-attachment">
+        <!-- 多文件下载列表（Team mode 多产物） -->
+        <div v-if="msg.downloadFiles && msg.downloadFiles.length" class="download-attachment download-list">
+          <div class="download-list-title">
+            <i class="fa-solid fa-folder-open"></i> 产物文件 ({{ msg.downloadFiles.length }})
+          </div>
+          <a
+            v-for="f in msg.downloadFiles"
+            :key="f.url"
+            :href="f.url"
+            :download="f.name"
+            class="download-btn"
+          >
+            <i class="fa-solid fa-download"></i>
+            <span class="download-label">{{ (f.format || 'FILE').toUpperCase() }}</span>
+            <span class="download-name">{{ f.name }}</span>
+          </a>
+        </div>
+        <!-- 兼容历史：单文件 downloadFile 仅在没有 downloadFiles 时单独渲染 -->
+        <div
+          v-else-if="msg.downloadFile"
+          class="download-attachment"
+        >
           <a :href="msg.downloadFile.url" :download="msg.downloadFile.name" class="download-btn">
             <i class="fa-solid fa-download"></i>
             <span class="download-label">下载 {{ msg.downloadFile.format }}</span>
@@ -643,6 +664,36 @@ function guessTitleFromContext(text, openIdx) {
 
 .download-attachment {
   margin-top: 8px;
+}
+
+/* 多文件下载列表 */
+.download-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.download-list-title {
+  font-size: 12px;
+  color: #475569;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 2px;
+}
+
+.download-list-title i {
+  color: #3b82f6;
+}
+
+@media (prefers-color-scheme: dark) {
+  .download-list-title {
+    color: #cbd5e1;
+  }
+  .download-list-title i {
+    color: #60a5fa;
+  }
 }
 
 .download-btn {

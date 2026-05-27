@@ -1,5 +1,5 @@
 import { nextTick } from 'vue'
-import { store } from '../store.js'
+import { store, getActiveSession, getActiveMode, setSessionPrimitive } from '../store.js'
 import { parseSSEStream, streamFetch, apiFetch, getAccessCode } from '../utils/sse.js'
 import { saveCurrentConversation, refreshHistoryGroups } from './useHistory.js'
 import { loadUserPreferences, injectPreferences, rememberUserPreference } from './usePreferences.js'
@@ -13,9 +13,6 @@ export function scrollToBottom() {
   })
 }
 
-let todoSeq = 0
-let pendingProcessBlock = null
-
 function createEmptyTaskPlan() {
   return {
     steps: [],
@@ -28,11 +25,31 @@ function createEmptyTaskPlan() {
   }
 }
 
-function ensureTaskPlan() {
-  if (!store.taskPlan || !Array.isArray(store.taskPlan.steps)) {
-    store.taskPlan = createEmptyTaskPlan()
+// 创建一个 streamChat 级别的请求上下文。每次 streamChat 启动一个，
+// 包含 ownerSession（写入目标）+ ownerMode（启动时的 mode 快照）+ 一些请求级状态。
+function createStreamCtx() {
+  const ownerSession = getActiveSession()
+  const ownerMode = getActiveMode()
+  return {
+    ownerSession,
+    ownerMode,
+    todoSeq: 0,
+    pendingProcessBlock: null,
   }
-  return store.taskPlan
+}
+
+// 原语字段写入帮助：写 ownerSession，且当 ownerMode === store.agentMode 时同步到顶层。
+function setPrim(ctx, key, value) {
+  setSessionPrimitive(ctx.ownerSession, ctx.ownerMode, key, value)
+}
+
+function ensureTaskPlan(ctx) {
+  const s = ctx.ownerSession
+  if (!s.taskPlan || !Array.isArray(s.taskPlan.steps)) {
+    s.taskPlan = createEmptyTaskPlan()
+    if (ctx.ownerMode === store.agentMode) store.taskPlan = s.taskPlan
+  }
+  return s.taskPlan
 }
 
 function extractLinks(text) {
@@ -42,22 +59,23 @@ function extractLinks(text) {
   return [...new Set(matches)]
 }
 
-function addTodo(text, agent) {
-  todoSeq++
-  const existing = store.taskTodos.find(t => t.status === 'running')
+function addTodo(ctx, text, agent) {
+  ctx.todoSeq++
+  const s = ctx.ownerSession
+  const existing = s.taskTodos.find(t => t.status === 'running')
   if (existing) {
     existing.status = 'done'
   }
-  store.taskTodos.push({
-    id: 'td-' + todoSeq,
+  s.taskTodos.push({
+    id: 'td-' + ctx.todoSeq,
     text: (agent && !text.startsWith(agent) ? `[${agent}] ` : '') + text,
     status: 'running',
     agent: agent || ''
   })
 }
 
-function markTodoDone(text) {
-  const match = store.taskTodos.find(t => t.status === 'running' && t.text.includes(text))
+function markTodoDone(ctx, text) {
+  const match = ctx.ownerSession.taskTodos.find(t => t.status === 'running' && t.text.includes(text))
   if (match) {
     match.status = 'done'
   }
@@ -69,77 +87,80 @@ function calcPlanProgress(steps) {
   return Math.round((done / steps.length) * 100)
 }
 
-function addSkill(name, agent) {
+function addSkill(ctx, name, agent) {
   if (!name) return
-  const exists = store.referenceSkills.find(s => s.name === name)
+  const s = ctx.ownerSession
+  const exists = s.referenceSkills.find(x => x.name === name)
   if (exists) {
     exists.count = (exists.count || 1) + 1
   } else {
-    store.referenceSkills.push({ name, count: 1, agent: agent || '' })
+    s.referenceSkills.push({ name, count: 1, agent: agent || '' })
   }
 }
 
-function addLink(url, title, agent) {
+function addLink(ctx, url, title, agent) {
   if (!url) return
-  const exists = store.referenceLinks.find(l => l.url === url)
+  const s = ctx.ownerSession
+  const exists = s.referenceLinks.find(l => l.url === url)
   if (!exists) {
-    store.referenceLinks.push({ url, title: title || url, agent: agent || '' })
+    s.referenceLinks.push({ url, title: title || url, agent: agent || '' })
   }
 }
 
-function ensureAssistantMessage() {
-  const msgs = store.messages
+function ensureAssistantMessage(ctx) {
+  const msgs = ctx.ownerSession.messages
   const lastMsg = msgs[msgs.length - 1]
   if (lastMsg && lastMsg.role === 'assistant') {
     return lastMsg
   }
   const newMsg = { role: 'assistant', content: '', timestamp: Date.now() }
-  if (pendingProcessBlock) {
-    newMsg.processBlock = pendingProcessBlock
-    pendingProcessBlock = null
+  if (ctx.pendingProcessBlock) {
+    newMsg.processBlock = ctx.pendingProcessBlock
+    ctx.pendingProcessBlock = null
   }
   msgs.push(newMsg)
   return newMsg
 }
 
-function syncProcessBlock() {
-  const hasData = store.taskTodos.length > 0 || store.referenceSkills.length > 0 || store.referenceLinks.length > 0
+function syncProcessBlock(ctx) {
+  const s = ctx.ownerSession
+  const hasData = s.taskTodos.length > 0 || s.referenceSkills.length > 0 || s.referenceLinks.length > 0
   if (!hasData) return
-  const targetMsg = ensureAssistantMessage()
+  const targetMsg = ensureAssistantMessage(ctx)
   const snapshot = {
-    todos: store.taskTodos.map(t => ({ ...t })),
-    skills: store.referenceSkills.map(s => ({ ...s })),
-    links: store.referenceLinks.map(l => ({ ...l })),
+    todos: s.taskTodos.map(t => ({ ...t })),
+    skills: s.referenceSkills.map(x => ({ ...x })),
+    links: s.referenceLinks.map(l => ({ ...l })),
     collapsed: targetMsg.processBlock?.collapsed ?? false
   }
   targetMsg.processBlock = snapshot
 }
 
-function handleSSEEvent(eventType, data) {
+function handleSSEEvent(eventType, data, ctx) {
+  const s = ctx.ownerSession
   try {
-  // [Spectra debug] 记录每个事件的类型和关键数据
-  const dataType = typeof data
-  const dataSummary = dataType === 'string' ? ('str:' + data.slice(0, 60)) : (dataType === 'object' ? (data && data.tool ? 'tool:' + data.tool : (data && data.content ? 'content:' + String(data.content).slice(0, 40) : 'obj')) : dataType)
-  console.log('[Spectra] handleSSEEvent:', eventType, dataSummary, 'msgs:', store.messages.length)
+    const dataType = typeof data
+    const dataSummary = dataType === 'string' ? ('str:' + data.slice(0, 60)) : (dataType === 'object' ? (data && data.tool ? 'tool:' + data.tool : (data && data.content ? 'content:' + String(data.content).slice(0, 40) : 'obj')) : dataType)
+    console.log('[Spectra] handleSSEEvent:', eventType, dataSummary, 'mode:', ctx.ownerMode, 'msgs:', s.messages.length)
 
   switch (eventType) {
     case 'error':
       console.error('[Spectra] SSE error event:', data)
-      store.thinkingStatus = '发生错误'
+      setPrim(ctx, 'thinkingStatus', '发生错误')
       {
-        const targetMsg = ensureAssistantMessage()
+        const targetMsg = ensureAssistantMessage(ctx)
         const errText = typeof data === 'string' ? data : (data && data.message ? data.message : JSON.stringify(data))
         targetMsg.content = `**❌ Agent 错误:**\n${errText}`
       }
-      store.loading = false
+      setPrim(ctx, 'loading', false)
       break
 
     case 'node':
       if (data && data.status) {
-        store.thinkingStatus = data.status
-        addTodo(data.status, data.node || data.agent || '')
+        setPrim(ctx, 'thinkingStatus', data.status)
+        addTodo(ctx, data.status, data.node || data.agent || '')
       }
-      syncProcessBlock()
+      syncProcessBlock(ctx)
       scrollToBottom()
       break
 
@@ -147,85 +168,83 @@ function handleSSEEvent(eventType, data) {
       if (data) {
         const text = typeof data === 'string' ? data : (data.text || '')
         const content = text.replace(/\\n/g, '\n')
-        const targetMsg = ensureAssistantMessage()
+        const targetMsg = ensureAssistantMessage(ctx)
         targetMsg.content = content
       }
-      syncProcessBlock()
+      syncProcessBlock(ctx)
       scrollToBottom()
       break
 
     case 'llm_stream':
       if (data && data.content) {
-        const targetMsg = ensureAssistantMessage()
+        const targetMsg = ensureAssistantMessage(ctx)
         targetMsg.content += data.content
-        // [Spectra debug] 追踪内容积累
         if (targetMsg.content.length < 200 || targetMsg.content.length % 500 < data.content.length) {
           console.log('[Spectra] llm_stream: total len=' + targetMsg.content.length)
         }
       }
-      syncProcessBlock()
+      syncProcessBlock(ctx)
       scrollToBottom()
       break
 
     case 'reasoning_stream':
       if (data && data.content) {
-        const targetMsg = ensureAssistantMessage()
+        const targetMsg = ensureAssistantMessage(ctx)
         if (typeof targetMsg.reasoning !== 'string') {
           targetMsg.reasoning = ''
         }
         targetMsg.reasoning += data.content
-        store.thinkingStatus = '模型思考中...'
+        setPrim(ctx, 'thinkingStatus', '模型思考中...')
       }
-      syncProcessBlock()
+      syncProcessBlock(ctx)
       scrollToBottom()
       break
 
     case 'tool_start':
       if (data && data.tool) {
-        store.currentToolCalls.push({
+        s.currentToolCalls.push({
           name: data.tool,
           input: data.input,
           status: 'running',
         })
         const skillName = data.skill ? data.skill.name : null
         const displayName = skillName || data.tool
-        store.thinkingStatus = skillName
+        setPrim(ctx, 'thinkingStatus', skillName
           ? `正在使用技能: ${skillName} (${data.tool})...`
-          : `正在调用工具: ${data.tool}...`
-        // 只记录真实 skill 名称，不再把 tool 名当 skill
+          : `正在调用工具: ${data.tool}...`)
         if (skillName) {
-          addSkill(skillName, data.agent || '')
+          addSkill(ctx, skillName, data.agent || '')
         }
-        addTodo(`调用 ${displayName}`, data.agent || '')
+        addTodo(ctx, `调用 ${displayName}`, data.agent || '')
       }
-      syncProcessBlock()
+      syncProcessBlock(ctx)
       break
 
     case 'tool_result':
       if (data && data.tool) {
-        const tc = store.currentToolCalls.find(
+        const tc = s.currentToolCalls.find(
           t => t.name === data.tool && t.status === 'running'
         )
         if (tc) {
           tc.status = 'done'
           tc.output = data.output
         }
-        store.thinkingStatus = `工具 ${data.tool} 执行完成`
-        markTodoDone(data.tool)
+        setPrim(ctx, 'thinkingStatus', `工具 ${data.tool} 执行完成`)
+        markTodoDone(ctx, data.tool)
         if (data.output && (data.tool === 'web_search' || data.tool === 'web-search' || data.tool.includes('web'))) {
           const links = extractLinks(data.output)
-          links.forEach(url => addLink(url, url, data.agent || ''))
+          links.forEach(url => addLink(ctx, url, url, data.agent || ''))
         }
       }
-      syncProcessBlock()
+      syncProcessBlock(ctx)
       break
 
     case 'runtime':
       if (data) {
         const payload = typeof data === 'string' ? JSON.parse(data) : data
-        Object.assign(store.runtimeState, payload)
+        Object.assign(s.runtimeState, payload)
         if (payload.lifecycle_event) {
-          store.runtimeTimeline.unshift({
+          s.runtimeTimeline.unshift({
             key: payload.lifecycle_event + Date.now(),
             node: payload.node || '',
             activeAgent: payload.active_agent || '',
@@ -234,41 +253,54 @@ function handleSSEEvent(eventType, data) {
           })
           if (payload.lifecycle_event === 'node_start' || payload.lifecycle_event === 'task_start') {
             const desc = payload.node || payload.active_agent || payload.lifecycle_event
-            addTodo(desc, payload.active_agent || '')
+            addTodo(ctx, desc, payload.active_agent || '')
           }
         }
       }
-      syncProcessBlock()
+      syncProcessBlock(ctx)
       break
 
     case 'message':
       if (data && typeof data === 'string') {
-        const targetMsg = ensureAssistantMessage()
+        const targetMsg = ensureAssistantMessage(ctx)
         targetMsg.content = data.replace(/\\n/g, '\n')
       }
-      syncProcessBlock()
+      syncProcessBlock(ctx)
       scrollToBottom()
       break
 
     case 'artifacts':
       if (data) {
         let items = typeof data === 'string' ? JSON.parse(data) : data
-        if (Array.isArray(items)) {          items.forEach(item => {
+        if (Array.isArray(items)) {
+          const targetMsg = ensureAssistantMessage(ctx)
+          if (!Array.isArray(targetMsg.downloadFiles)) targetMsg.downloadFiles = []
+          items.forEach(item => {
+            const url = item.url || item.path
+            const name = item.name || (url ? url.split('/').pop() : '')
             if (item.type === 'chart_html') {
-              if (!store.charts.includes(item.path)) {
-                store.charts.push(item.path)
-                const chartExists = store.taskArtifacts.some(a => a.url === item.path)
+              if (url && !s.charts.includes(url)) {
+                s.charts.push(url)
+                const chartExists = s.taskArtifacts.some(a => a.url === url)
                 if (!chartExists) {
-                  store.taskArtifacts.push({ id: 'ar-' + Date.now(), type: 'chart', name: item.name || '图表', url: item.path })
+                  s.taskArtifacts.push({ id: 'ar-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6), type: 'chart', name: name || '图表', url })
                 }
               }
             } else {
-              const exists = store.files.some(f => f.path === item.path)
-              if (!exists) {
-                store.files.push({ name: item.name || item.path.split('/').pop(), path: item.path })
-                const artExists = store.taskArtifacts.some(a => a.url === item.path)
+              if (url) {
+                const exists = s.files.some(f => f.path === url)
+                if (!exists) {
+                  s.files.push({ name, path: url })
+                }
+                const artExists = s.taskArtifacts.some(a => a.url === url)
                 if (!artExists) {
-                  store.taskArtifacts.push({ id: 'ar-' + Date.now(), type: item.type || 'file', name: item.name || item.path.split('/').pop(), url: item.path })
+                  s.taskArtifacts.push({ id: 'ar-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6), type: item.type || 'file', name, url })
+                }
+                // 把可下载文件追加到当前 assistant 消息的下载列表
+                const dup = targetMsg.downloadFiles.find(x => x.url === url)
+                if (!dup) {
+                  const fmt = (name.split('.').pop() || item.type || 'FILE').toUpperCase()
+                  targetMsg.downloadFiles.push({ name, url, format: fmt, type: item.type || 'misc' })
                 }
               }
             }
@@ -280,33 +312,44 @@ function handleSSEEvent(eventType, data) {
 
     case 'file':
       if (data && data.url) {
-        const targetMsg = ensureAssistantMessage()
-        targetMsg.downloadFile = {
+        const targetMsg = ensureAssistantMessage(ctx)
+        const fileEntry = {
           name: data.name || data.url.split('/').pop(),
           url: data.url,
-          format: data.format || 'FILE'
+          format: data.format || 'FILE',
+          type: data.type || 'misc',
         }
-        store.taskArtifacts.push({
-          id: 'ar-' + Date.now(),
-          type: 'report',
-          name: data.name || data.url.split('/').pop(),
-          url: data.url
-        })
+        // 兼容历史：保留 downloadFile（取最后一个），同时维护完整列表 downloadFiles
+        targetMsg.downloadFile = fileEntry
+        if (!Array.isArray(targetMsg.downloadFiles)) targetMsg.downloadFiles = []
+        const dup = targetMsg.downloadFiles.find(x => x.url === fileEntry.url)
+        if (!dup) targetMsg.downloadFiles.push(fileEntry)
+
+        if (!s.taskArtifacts) s.taskArtifacts = []
+        const existsArt = s.taskArtifacts.find(x => x.url === fileEntry.url)
+        if (!existsArt) {
+          s.taskArtifacts.push({
+            id: 'ar-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6),
+            type: data.type || 'report',
+            name: fileEntry.name,
+            url: fileEntry.url,
+          })
+        }
       }
       scrollToBottom()
       break
 
-    // Phase 2: plan 事件处理
     case 'plan_created':
       if (data && data.steps) {
-        store.taskPlan = {
-          steps: data.steps.map(s => ({
-            id: s.id,
-            description: s.description,
-            status: s.status || 'pending',
-            note: s.note || '',
-            startedAt: s.started_at || 0,
-            finishedAt: s.finished_at || 0,
+        const newPlan = {
+          steps: data.steps.map(step => ({
+            id: step.id,
+            description: step.description,
+            agent: step.assignee_agent_id || '',
+            status: step.status || 'pending',
+            note: step.note || '',
+            startedAt: step.started_at || 0,
+            finishedAt: step.finished_at || 0,
           })),
           revision: data.revision || 0,
           finished: false,
@@ -315,15 +358,17 @@ function handleSSEEvent(eventType, data) {
           createdAt: Date.now(),
           progress: calcPlanProgress(data.steps),
         }
-        store.thinkingStatus = `计划已创建: ${data.steps.length} 个步骤`
+        s.taskPlan = newPlan
+        if (ctx.ownerMode === store.agentMode) store.taskPlan = newPlan
+        setPrim(ctx, 'thinkingStatus', `计划已创建: ${data.steps.length} 个步骤`)
       }
       break
 
     case 'plan_updated':
       if (data && data.changes) {
-        const taskPlan = ensureTaskPlan()
+        const taskPlan = ensureTaskPlan(ctx)
         for (const ch of data.changes) {
-          const step = taskPlan.steps.find(s => s.id === ch.step_id)
+          const step = taskPlan.steps.find(x => x.id === ch.step_id)
           if (step) {
             step.status = ch.status
             if (ch.note) step.note = ch.note
@@ -335,35 +380,153 @@ function handleSSEEvent(eventType, data) {
       }
       break
 
-    case 'plan_revised':
-      if (data && data.steps) {
-        const taskPlan = ensureTaskPlan()
-        taskPlan.steps = data.steps.map(s => ({
-          id: s.id,
-          description: s.description,
-          status: s.status || 'pending',
-          note: s.note || '',
-          startedAt: s.started_at || 0,
-          finishedAt: s.finished_at || 0,
-        }))
-        taskPlan.revision = data.revision || 0
-        taskPlan.progress = calcPlanProgress(data.steps)
-        store.thinkingStatus = `计划已重排 (v${data.revision})`
+    case 'step_started':
+      if (data) {
+        const payload = typeof data === 'string' ? JSON.parse(data) : data
+        const taskPlan = ensureTaskPlan(ctx)
+        const step = taskPlan.steps.find(x => x.id === payload.step_id)
+        if (step) {
+          step.status = 'running'
+          step.startedAt = Date.now()
+        }
+        taskPlan.progress = calcPlanProgress(taskPlan.steps)
+        const desc = payload.description || (step ? step.description : '') || ''
+        const agent = payload.assignee_agent_id || (step ? step.agent : '')
+        const label = agent ? `[${agent}]` : ''
+        setPrim(ctx, 'thinkingStatus',
+          `${label} 正在执行: ${desc.slice(0, 60)}${desc.length > 60 ? '…' : ''}`)
+        addTodo(ctx, desc || `执行步骤 ${payload.step_id}`, agent)
+        // 把执行进度写到 assistant 消息体里，让用户在主聊天区看到实时执行流
+        const targetMsg = ensureAssistantMessage(ctx)
+        targetMsg.content = (targetMsg.content || '') +
+          `\n\n🔄 ${label} **正在执行**：${desc}\n`
+        scrollToBottom()
       }
       break
 
-    case 'plan_finished':
-      ensureTaskPlan()
-      store.taskPlan.finished = true
-      store.taskPlan.finishReason = data.finish_reason || 'completed'
-      store.taskPlan.summary = data.summary || ''
+    case 'step_completed':
+      if (data) {
+        const payload = typeof data === 'string' ? JSON.parse(data) : data
+        const taskPlan = ensureTaskPlan(ctx)
+        const step = taskPlan.steps.find(x => x.id === payload.step_id)
+        if (step) {
+          step.status = 'done'
+          step.finishedAt = Date.now()
+          if (payload.reply) step.note = payload.reply
+        }
+        taskPlan.progress = calcPlanProgress(taskPlan.steps)
+        const agent = step ? step.agent : ''
+        const label = agent ? `[${agent}]` : ''
+        markTodoDone(ctx, step ? step.description : payload.step_id)
+        setPrim(ctx, 'thinkingStatus',
+          `${label} 步骤完成 (${taskPlan.progress}%)`)
+
+        // 把完成消息和产物写入 assistant 消息流
+        const targetMsg = ensureAssistantMessage(ctx)
+        const desc = step ? step.description : payload.step_id
+        let chunk = `\n✅ ${label} **完成**：${desc}\n`
+        const reply = (payload.reply || '').trim()
+        if (reply) {
+          // 截断过长的 step.reply（长篇分析报告等），避免把 chat 区刷爆
+          const truncated = reply.length > 800 ? reply.slice(0, 800) + '…' : reply
+          chunk += `\n${truncated}\n`
+        }
+
+        // 收集 artifacts：写到消息的 downloadFiles 列表 + 右侧 ProcessSidebar 任务产物
+        const artifacts = Array.isArray(payload.artifacts) ? payload.artifacts : []
+        if (artifacts.length) {
+          if (!s.taskArtifacts) s.taskArtifacts = []
+          if (!Array.isArray(targetMsg.downloadFiles)) targetMsg.downloadFiles = []
+          for (const a of artifacts) {
+            const url = a.url || (a.path ? `/files/${a.path}` : '')
+            const name = a.name || (url ? url.split('/').pop() : '')
+            if (!url || !name) continue
+
+            // 写入右侧任务产物列表（ProcessSidebar 会读 store.taskArtifacts）
+            const exists = s.taskArtifacts.find(x => x.url === url)
+            if (!exists) {
+              s.taskArtifacts.push({
+                id: 'art-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6),
+                type: a.type || 'misc',
+                name,
+                path: a.path || '',
+                url,
+              })
+            }
+
+            // 写入消息体的下载列表
+            const dupInMsg = targetMsg.downloadFiles.find(x => x.url === url)
+            if (!dupInMsg) {
+              const fmt = (name.split('.').pop() || a.type || 'FILE').toUpperCase()
+              targetMsg.downloadFiles.push({ name, url, format: fmt, type: a.type || 'misc' })
+            }
+          }
+        }
+
+        targetMsg.content = (targetMsg.content || '') + chunk
+        scrollToBottom()
+      }
       break
+
+    case 'step_failed':
+      if (data) {
+        const payload = typeof data === 'string' ? JSON.parse(data) : data
+        const taskPlan = ensureTaskPlan(ctx)
+        const step = taskPlan.steps.find(x => x.id === payload.step_id)
+        if (step) {
+          step.status = 'failed'
+          step.finishedAt = Date.now()
+          if (payload.error) step.note = payload.error
+        }
+        taskPlan.progress = calcPlanProgress(taskPlan.steps)
+        const retryHint = payload.retry_count > 0 ? ` (第 ${payload.retry_count} 次重试)` : ''
+        setPrim(ctx, 'thinkingStatus',
+          `❌ 步骤失败${retryHint}: ${(payload.error || '').slice(0, 80)}`)
+
+        // 写到 assistant 消息流
+        const targetMsg = ensureAssistantMessage(ctx)
+        const agent = step ? step.agent : ''
+        const label = agent ? `[${agent}]` : ''
+        const desc = step ? step.description : payload.step_id
+        const errPreview = (payload.error || '').slice(0, 200)
+        targetMsg.content = (targetMsg.content || '') +
+          `\n❌ ${label} **失败**${retryHint}：${desc}\n\`\`\`\n${errPreview}\n\`\`\`\n`
+        scrollToBottom()
+      }
+      break
+
+    case 'plan_revised':
+      if (data && data.steps) {
+        const taskPlan = ensureTaskPlan(ctx)
+        taskPlan.steps = data.steps.map(step => ({
+          id: step.id,
+          description: step.description,
+          agent: step.assignee_agent_id || '',
+          status: step.status || 'pending',
+          note: step.note || '',
+          startedAt: step.started_at || 0,
+          finishedAt: step.finished_at || 0,
+        }))
+        taskPlan.revision = data.revision || 0
+        taskPlan.progress = calcPlanProgress(data.steps)
+        setPrim(ctx, 'thinkingStatus', `计划已重排 (v${data.revision})`)
+      }
+      break
+
+    case 'plan_finished': {
+      const tp = ensureTaskPlan(ctx)
+      tp.finished = true
+      tp.finishReason = data.finish_reason || 'completed'
+      tp.summary = data.summary || ''
+      break
+    }
 
     case 'usage':
       if (data) {
         const payload = typeof data === 'string' ? JSON.parse(data) : data
         if (payload && payload.total) {
-          store.usageStats = payload
+          s.usageStats = payload
+          if (ctx.ownerMode === store.agentMode) store.usageStats = payload
         }
       }
       break
@@ -372,58 +535,139 @@ function handleSSEEvent(eventType, data) {
       if (data) {
         const payload = typeof data === 'string' ? JSON.parse(data) : data
         if (payload && payload.type) {
-          store.thinkingStatus = `[Supervisor] ${payload.type}`
-          addTodo(`Supervisor: ${payload.type}`, 'Supervisor')
+          setPrim(ctx, 'thinkingStatus', `[Supervisor] ${payload.type}`)
+          addTodo(ctx, `Supervisor: ${payload.type}`, 'Supervisor')
         }
       }
-      syncProcessBlock()
+      syncProcessBlock(ctx)
       break
 
     case 'agent_message':
       if (data) {
         const payload = typeof data === 'string' ? JSON.parse(data) : data
         if (payload && payload.reply) {
-          const targetMsg = ensureAssistantMessage()
+          const targetMsg = ensureAssistantMessage(ctx)
           const label = payload.agent_id ? `**${payload.agent_id}**` : '**Agent**'
           const codeHint = payload.has_code ? ' `[含代码]`' : ''
           targetMsg.content += `${label}${codeHint}:\n${payload.reply}\n\n`
-          store.thinkingStatus = `${payload.agent_id || 'Agent'} 已完成回复`
-          addTodo(`${label} 完成`, payload.agent_id || 'Agent')
+          setPrim(ctx, 'thinkingStatus', `${payload.agent_id || 'Agent'} 已完成回复`)
+          addTodo(ctx, `${label} 完成`, payload.agent_id || 'Agent')
         }
       }
-      syncProcessBlock()
+      syncProcessBlock(ctx)
       scrollToBottom()
       break
 
-    case 'done':
+    case 'member_status':
+      if (data) {
+        const payload = typeof data === 'string' ? JSON.parse(data) : data
+        if (payload && payload.agent_id) {
+          if (!s.members) s.members = {}
+          s.members[payload.agent_id] = {
+            state: payload.state || 'idle',
+            currentStepId: payload.current_step_id || '',
+          }
+        }
+      }
+      break
+
+    case 'task_pending':
+    case 'task_progress':
+    case 'task_completed':
+    case 'task_failed':
+      if (data) {
+        const payload = typeof data === 'string' ? JSON.parse(data) : data
+        if (payload && payload.task_id) {
+          if (!s.backgroundTasks) s.backgroundTasks = []
+          const existing = s.backgroundTasks.find(t => t.taskId === payload.task_id)
+          if (existing) {
+            Object.assign(existing, {
+              status: payload.status || existing.status,
+              title: payload.title || existing.title,
+              elapsed: payload.elapsed || '',
+            })
+          } else {
+            s.backgroundTasks.push({
+              taskId: payload.task_id,
+              agentId: payload.agent_id || '',
+              title: payload.title || '',
+              status: payload.status || 'pending',
+              elapsed: '',
+            })
+          }
+        }
+      }
+      break
+
+    case 'file_parsed':
+      if (data) {
+        const payload = typeof data === 'string' ? JSON.parse(data) : data
+        if (payload && payload.file_id) {
+          if (!s.parsedFiles) s.parsedFiles = []
+          const exists = s.parsedFiles.find(f => f.fileId === payload.file_id)
+          if (!exists) {
+            s.parsedFiles.push({
+              fileId: payload.file_id,
+              mimeType: payload.mime_type || '',
+              summary: payload.summary || '',
+              previewPayload: payload.preview_payload || null,
+            })
+          }
+        }
+      }
+      break
+
+    case 'workspace_artifact_added':
+      if (data) {
+        const payload = typeof data === 'string' ? JSON.parse(data) : data
+        if (payload && payload.url) {
+          if (!s.workspaceArtifacts) s.workspaceArtifacts = []
+          const dup = s.workspaceArtifacts.find(x => x.url === payload.url)
+          if (!dup) {
+            s.workspaceArtifacts.push({
+              id: payload.id || ('ar-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6)),
+              type: payload.type || 'misc',
+              name: payload.name || '',
+              url: payload.url,
+            })
+          }
+          // 同时灌进当前 assistant 消息的下载列表
+          const targetMsg = ensureAssistantMessage(ctx)
+          if (!Array.isArray(targetMsg.downloadFiles)) targetMsg.downloadFiles = []
+          const dupInMsg = targetMsg.downloadFiles.find(x => x.url === payload.url)
+          if (!dupInMsg) {
+            const name = payload.name || payload.url.split('/').pop()
+            const fmt = (name.split('.').pop() || payload.type || 'FILE').toUpperCase()
+            targetMsg.downloadFiles.push({ name, url: payload.url, format: fmt, type: payload.type || 'misc' })
+          }
+        }
+      }
+      break
+
+    case 'done': {
       if (data) {
         const payload = typeof data === 'string' ? JSON.parse(data) : data
         if (payload && payload.thread_id) {
-          store.threadId = payload.thread_id
+          setPrim(ctx, 'threadId', payload.thread_id)
         }
       }
-      store.thinkingStatus = '任务完成 ✓'
-      store.loading = false
-      const runningTodo = store.taskTodos.find(t => t.status === 'running')
+      setPrim(ctx, 'thinkingStatus', '任务完成 ✓')
+      setPrim(ctx, 'loading', false)
+      const runningTodo = s.taskTodos.find(t => t.status === 'running')
       if (runningTodo) runningTodo.status = 'done'
 
-      // 确保始终有一条 assistant 消息存在（即使前面没有任何事件触发创建）
-      const lastAssistantMsg = ensureAssistantMessage()
+      const lastAssistantMsg = ensureAssistantMessage(ctx)
 
-      // [Spectra debug] 诊断日志：确认 done 时的消息状态
       if (lastAssistantMsg) {
         console.log('[Spectra] done:', {
           contentLen: (lastAssistantMsg.content || '').length,
           reasoningLen: (lastAssistantMsg.reasoning || '').length,
           hasProcessBlock: !!(lastAssistantMsg.processBlock && lastAssistantMsg.processBlock.todos && lastAssistantMsg.processBlock.todos.length > 0),
           hasDownloadFile: !!lastAssistantMsg.downloadFile,
-          totalMessages: store.messages.length,
+          totalMessages: s.messages.length,
         })
       }
 
-      // 健康检查：如果 assistant 消息是空的（LLM 没产出 content
-      // 就 done 了，通常是 tool_call 被中断），清理掉这条空消息并提示用户。
-      // 这避免下一次请求把空 AIMessage 再传回 LLM 导致 400。
       if (
         lastAssistantMsg &&
         !(lastAssistantMsg.content || '').trim() &&
@@ -431,27 +675,30 @@ function handleSSEEvent(eventType, data) {
         !lastAssistantMsg.downloadFile &&
         !(lastAssistantMsg.processBlock && lastAssistantMsg.processBlock.todos && lastAssistantMsg.processBlock.todos.length > 0)
       ) {
-        // 完全空的 assistant 消息 → 移除并替换为警告
-        const idx = store.messages.lastIndexOf(lastAssistantMsg)
-        if (idx >= 0) store.messages.splice(idx, 1)
-        store.messages.push({
+        const idx = s.messages.lastIndexOf(lastAssistantMsg)
+        if (idx >= 0) s.messages.splice(idx, 1)
+        s.messages.push({
           role: 'assistant',
           content: '**⚠️ 上次回复中断**：模型没有完成响应。请重新发送或尝试更简短的请求。',
           timestamp: Date.now(),
         })
       }
 
-      syncProcessBlock()
-      saveCurrentConversation()
-      refreshHistoryGroups()
-      const mature = checkConversationMaturity()
-      store.suggestExport = mature
+      syncProcessBlock(ctx)
+      // 仅在原 mode 仍是当前活跃 mode 时持久化（避免覆盖另一个 mode 的对话）
+      if (ctx.ownerMode === store.agentMode) {
+        saveCurrentConversation()
+        refreshHistoryGroups()
+      }
+      const lastA = [...s.messages].reverse().find(m => m.role === 'assistant')
+      const mature = !!(lastA && lastA.content && lastA.content.length >= 800)
+      setPrim(ctx, 'suggestExport', mature)
       if (mature) {
-        const alreadySuggested = store.messages.some(m =>
+        const alreadySuggested = s.messages.some(m =>
           m.role === 'assistant' && m.content && m.content.includes('导出为 PDF 或 DOCX')
         )
         if (!alreadySuggested) {
-          store.messages.push({
+          s.messages.push({
             role: 'assistant',
             content: '本次分析内容比较丰富，是否需要我帮您整理导出为 PDF 或 DOCX 格式的文档？（回复「导出 pdf」或「导出 docx」即可）',
             timestamp: Date.now(),
@@ -460,69 +707,75 @@ function handleSSEEvent(eventType, data) {
       }
       scrollToBottom()
       break
-
-    case 'error':
-      ensureAssistantMessage().content = `**❌ 执行出错:**\n${data}`
-      store.loading = false
-      syncProcessBlock()
-      scrollToBottom()
-      break
+    }
   }
   } catch (e) {
     console.error('[Spectra] handleSSEEvent 异常:', e)
     try {
-      const errMsg = ensureAssistantMessage()
+      const errMsg = ensureAssistantMessage(ctx)
       errMsg.content = (errMsg.content || '') + `\n\n**❌ 处理事件异常:**\n${e.message}`
     } catch (_) {}
-    store.loading = false
+    setPrim(ctx, 'loading', false)
   }
 }
 
 export async function streamChat(body) {
-  store.loading = true
-  store.thinkingStatus = '正在连接 Agent 服务...'
-  store.abortController = new AbortController()
+  const ctx = createStreamCtx()
+  const s = ctx.ownerSession
 
-  const msgCountBefore = store.messages.length
+  setPrim(ctx, 'loading', true)
+  setPrim(ctx, 'thinkingStatus', '正在连接 Agent 服务...')
+  const ac = new AbortController()
+  // abortController 是原语级别的对象引用，仍用 setPrim 同步顶层
+  setPrim(ctx, 'abortController', ac)
+
   let eventCount = 0
 
   try {
-    const endpoint = store.agentMode === 'team' ? '/api/v2/chat' : '/api/chat'
-    console.log(`[Spectra] 🎯 Agent 模式: ${store.agentMode.toUpperCase()} → 请求端点: ${endpoint}`)
-    const response = await streamFetch(endpoint, body, store.abortController.signal)
+    const endpoint = ctx.ownerMode === 'team' ? '/api/v2/chat' : '/api/chat'
+    console.log(`[Spectra] 🎯 Agent 模式: ${ctx.ownerMode.toUpperCase()} → 请求端点: ${endpoint}`)
+    const response = await streamFetch(endpoint, body, ac.signal)
     for await (const { event, data } of parseSSEStream(response)) {
       eventCount++
-      handleSSEEvent(event, data)
+      handleSSEEvent(event, data, ctx)
     }
 
-    // 兜底：如果流结束了但没有创建任何 assistant 消息，手动创建一条
-    const lastMsg = store.messages[store.messages.length - 1]
+    // 兜底：流结束但无 assistant 消息
+    const lastMsg = s.messages[s.messages.length - 1]
     if (!lastMsg || lastMsg.role !== 'assistant' || !(lastMsg.content || '').trim()) {
       console.warn('[Spectra] SSE 流结束但无 assistant 消息，创建兜底消息。eventCount:', eventCount)
       if (!lastMsg || lastMsg.role !== 'assistant') {
-        store.messages.push({ role: 'assistant', content: '', timestamp: Date.now() })
+        s.messages.push({ role: 'assistant', content: '', timestamp: Date.now() })
       }
-      const assistantMsg = store.messages[store.messages.length - 1]
+      const assistantMsg = s.messages[s.messages.length - 1]
       if (!(assistantMsg.content || '').trim()) {
         assistantMsg.content = '**⚠️ 无法解析模型回复**：Agent 完成了处理，但未能提取到有效文本。请重试或检查模型 API 配置。'
       }
     }
   } catch (e) {
     if (e.name !== 'AbortError') {
-      store.messages.push({ role: 'assistant', content: `**❌ 连接异常:**\n${e.message}`, timestamp: Date.now() })
+      s.messages.push({ role: 'assistant', content: `**❌ 连接异常:**\n${e.message}`, timestamp: Date.now() })
     }
   } finally {
-    store.loading = false
-    store.abortController = null
-    scrollToBottom()
+    setPrim(ctx, 'loading', false)
+    setPrim(ctx, 'abortController', null)
+    if (ctx.ownerMode === store.agentMode) {
+      scrollToBottom()
+    }
   }
 }
 
 export function handleStop() {
-  if (store.abortController) {
-    store.abortController.abort()
-    store.abortController = null
+  // 只停当前 mode 的请求
+  const s = getActiveSession()
+  if (s.abortController) {
+    s.abortController.abort()
+    s.abortController = null
   }
+  s.loading = false
+  s.thinkingStatus = '已停止'
+  // 同步顶层
+  store.abortController = null
   store.loading = false
   store.thinkingStatus = '已停止'
 }
@@ -539,18 +792,22 @@ export async function regenerateMessage(assistantMsgIndex) {
   }
   if (!userMsg || !userMsg.content) return
 
-  store.messages.splice(assistantMsgIndex)
-
+  // 注意：这里只能修改顶层 store 字段（用 splice/length=0 等就地清空）
+  // 不能用 store.X = [] 替换引用，否则会和当前 mode 的 session 容器脱钩。
+  const s = getActiveSession()
+  s.messages.splice(assistantMsgIndex)
+  s.currentToolCalls.length = 0
+  s.taskTodos.length = 0
+  s.taskArtifacts.length = 0
+  s.referenceSkills.length = 0
+  s.referenceLinks.length = 0
+  // taskPlan / usageStats 是对象，就地清空
+  Object.assign(s.taskPlan, createEmptyTaskPlan())
+  s.usageStats.by_model = {}
+  s.usageStats.total = { input_tokens: 0, output_tokens: 0, total_tokens: 0 }
+  s.abortController = null
+  // 同步顶层（因为是当前 mode）
   store.abortController = null
-  store.currentToolCalls = []
-  store.taskTodos = []
-  store.taskArtifacts = []
-  store.taskPlan = createEmptyTaskPlan()
-  store.referenceSkills = []
-  store.referenceLinks = []
-  store.usageStats = { by_model: {}, total: { input_tokens: 0, output_tokens: 0, total_tokens: 0 } }
-  todoSeq = 0
-  pendingProcessBlock = null
 
   await streamChat({
     message: buildAgentMessage(userMsg.content),
@@ -798,18 +1055,21 @@ export async function handlePrimarySend() {
     msg = `[附带文件: ${fileNames}]\n${msg}`
   }
 
-  store.messages.push({ role: 'user', content: msg, timestamp: Date.now() })
+  // 与 regenerateMessage 同样原则：就地清空，不替换引用
+  const s = getActiveSession()
+  s.messages.push({ role: 'user', content: msg, timestamp: Date.now() })
   store.userInput = ''
-  store.attachedFiles = []
-  store.currentToolCalls = []
-  store.taskTodos = []
-  store.taskArtifacts = []
-  store.taskPlan = createEmptyTaskPlan()
-  store.referenceSkills = []
-  store.referenceLinks = []
-  store.usageStats = { by_model: {}, total: { input_tokens: 0, output_tokens: 0, total_tokens: 0 } }
-  todoSeq = 0
-  pendingProcessBlock = null
+  s.userInput = ''
+  s.attachedFiles.length = 0
+  store.attachedFiles.length = 0
+  s.currentToolCalls.length = 0
+  s.taskTodos.length = 0
+  s.taskArtifacts.length = 0
+  s.referenceSkills.length = 0
+  s.referenceLinks.length = 0
+  Object.assign(s.taskPlan, createEmptyTaskPlan())
+  s.usageStats.by_model = {}
+  s.usageStats.total = { input_tokens: 0, output_tokens: 0, total_tokens: 0 }
   if (store.inputArea) store.inputArea.style.height = 'auto'
   scrollToBottom()
 
@@ -838,6 +1098,9 @@ export async function handlePrimarySend() {
     }
   }
 
+  const skillWorkflowId = store._skillWorkflowId || null
+  store._skillWorkflowId = null  // 消费一次后清除
+
   await streamChat({
     message: msg,
     thread_id: store.threadId,
@@ -851,6 +1114,7 @@ export async function handlePrimarySend() {
     })),
     db_alias: store.dbConfig.alias || '',
     export_content: exportContent,
+    skill_workflow_id: skillWorkflowId,
   })
 }
 

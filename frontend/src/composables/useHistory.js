@@ -1,4 +1,4 @@
-import { store } from '../store.js'
+import { store, syncTopToSession } from '../store.js'
 import { apiFetch } from '../utils/sse.js'
 
 // LocalStorage 仍保留作为离线兜底缓存：后端不可达时仍能读到上次同步的列表
@@ -182,6 +182,7 @@ export async function loadConversation(id) {
   store.currentView = 'chat'
   if (store.inputArea) store.inputArea.style.height = 'auto'
   if (store.isMobile) store.leftDrawerOpen = false
+  syncTopToSession()  // 把替换后的顶层引用同步到当前 mode session 容器
   await refreshHistoryGroups()
 }
 
@@ -229,6 +230,7 @@ export async function newChat() {
   resetRuntimeState()
   if (store.inputArea) store.inputArea.style.height = 'auto'
   if (store.isMobile) store.leftDrawerOpen = false
+  syncTopToSession()  // 把替换后的顶层引用同步到当前 mode session 容器
 }
 
 export function resetRuntimeState() {
@@ -238,6 +240,7 @@ export function resetRuntimeState() {
     executionMode: '', fallbackSource: '', executionBackend: '',
   }
   store.runtimeTimeline = []
+  syncTopToSession()  // 把替换后的引用同步到当前 mode session 容器
 }
 
 export function runtimeLifecycleLabel(eventName) {

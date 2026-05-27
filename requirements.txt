@@ -4,7 +4,7 @@ langchain
 langchain-openai
 pandas
 sqlalchemy
-openpyxl
+openpyxl>=3.1.5
 plotly
 matplotlib
 seaborn
@@ -32,3 +32,6 @@ weasyprint
 reportlab
 pypdf
 pdfplumber
+pdf2image
+python-pptx
+PyYAML
